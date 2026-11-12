@@ -186,7 +186,8 @@ class Archive:
         self._lock = threading.Lock()
         self._head = None               # (header dict, root directory bytes, etag)
         self._leaves = OrderedDict()
-        self._inflight = {}
+        self._inflight = {}             # tile key -> Event while one thread fetches it
+        self._leaf_inflight = {}        # (offset, length) -> Event while one thread fetches that leaf directory
 
     # --- bytes ------------------------------------------------------------------------------------
     def _get(self, start, end, kind, etag=None, short_ok=False):
@@ -258,6 +259,9 @@ class Archive:
         return got
 
     def _leaf(self, off, ln, kind, etag):
+        """Leaf directory (off, ln) as stored: memory, disk, else the network, one thread of the process at a time
+        (_fetch locates a cell's 9 tiles on FETCH_THREADS at once, and neighbouring tiles share their leaf: each
+        thread read the same cold leaf, 2026-11-12)."""
         k = (off, ln)
         with self._lock:
             b = self._leaves.get(k)
@@ -265,15 +269,41 @@ class Archive:
                 self._leaves.move_to_end(k)
                 return b
         path = os.path.join(self.dir, "leaf", f"{off}_{ln}")
-        b = _read(path)
-        if b is None or len(b) != ln:
-            h = self._head[0]
-            b, _ = self._get(h["leaf_offset"] + off, h["leaf_offset"] + off + ln, kind, etag)
-            _write(path, b)
+        b = self._leaf_disk(path, ln)
+        if b is None:
+            with self._lock:
+                ev = self._leaf_inflight.get(k)
+                mine = ev is None
+                if mine:
+                    ev = self._leaf_inflight[k] = threading.Event()
+            if mine:
+                try:
+                    b = self._leaf_disk(path, ln)   # (stored by a thread that let go between our look and the lock)
+                    if b is None:
+                        b = self._leaf_fetch(path, off, ln, kind, etag)
+                finally:
+                    with self._lock:
+                        self._leaf_inflight.pop(k).set()
+            else:
+                ev.wait(120.0)
+                b = self._leaf_disk(path, ln)
+                if b is None:                   # (the other thread failed: ask ourselves)
+                    b = self._leaf_fetch(path, off, ln, kind, etag)
         with self._lock:
             self._leaves[k] = b
             while len(self._leaves) > 256:
                 self._leaves.popitem(last=False)
+        return b
+
+    @staticmethod
+    def _leaf_disk(path, ln):
+        b = _read(path)
+        return b if b is not None and len(b) == ln else None
+
+    def _leaf_fetch(self, path, off, ln, kind, etag):
+        h = self._head[0]
+        b, _ = self._get(h["leaf_offset"] + off, h["leaf_offset"] + off + ln, kind, etag)
+        _write(path, b)
         return b
 
     def locate(self, z, x, y, kind):

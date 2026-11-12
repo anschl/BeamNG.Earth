@@ -15,6 +15,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -308,6 +309,29 @@ class ArchiveFormatTest(Base):
         r, f = self.reader({"transportation.pmtiles": archive(transportation(), leaf=True)})
         feats, _ = r.query("roads", CELL)
         self.assertEqual(list(feats.ids), ["seg-a", "seg-b"])
+
+
+class FetchOnceTest(Base):
+    """A cold leaf directory or tile is read from the network once, however many threads ask for it."""
+
+    def slow(self, f):
+        get = f.get
+
+        def slow_get(url, **kw):
+            time.sleep(0.05)            # (every thread of the pool inside a read at once)
+            return get(url, **kw)
+        f.get = slow_get
+
+    def test_a_leaf_shared_by_a_cells_tiles_is_read_once(self):
+        a = archive(transportation(), leaf=True)
+        h = fast._ef.pmt_header(a)
+        r, f = self.reader({"transportation.pmtiles": a})
+        self.slow(f)
+        t, cell = r.tiles_for("roads", CELL)
+        got = r.archive(t).tiles(cell, "demand")
+        self.assertEqual(gzip.decompress(got[A]), transportation()[A])
+        leaf = f"bytes={h['leaf_offset']}-{h['leaf_offset'] + h['leaf_length'] - 1}"
+        self.assertEqual(sum(rg == leaf for _, _, rg in f.seen), 1)
 
 
 class RoadsTest(Base):
