@@ -496,8 +496,9 @@ def _decode(data):
 
 
 def _draws_whole(t):
-    """A source tile (not the chain's last) render draws in full: data, not uniform, no nodata hole. Pure."""
-    return isinstance(t, Tile) and not t.uniform and nodata_mask(t.rgb) is None
+    """A source tile (not the chain's last) render draws in full: data, not uniform, no nodata hole (or one that did
+    when it was decoded, its file still there: _WHOLE_ON_DISK). Pure."""
+    return t is _WHOLE_ON_DISK or (isinstance(t, Tile) and not t.uniform and nodata_mask(t.rgb) is None)
 
 
 QUICK_OVERZOOM = 4          # levels up a quick render looks for the same source's tile on disk (Imagery._quick_ancestor)
@@ -555,6 +556,8 @@ DS_PENDING = "ds"
 IMG_PENDING = "img"
 LATER_WORKERS = 6           # fetch_later's batches downloading at once
 _ON_DISK = "on disk"        # (Imagery._known: a tile's file is there, not decoded)
+_WHOLE_ON_DISK = "whole on disk"    # (... and it drew whole when it was decoded: Imagery._whole)
+WHOLE_MEMO = 200000         # tiles whose _draws_whole verdict Imagery._whole keeps (cleared beyond)
 
 
 class Imagery:
@@ -613,6 +616,9 @@ class Imagery:
         self._export_locks = {}             # export parent -> its fetch lock (_download_export)
         self._downloads = {}                # plain tile's path -> (Event, kind) of its download in flight (_claim)
         self._full_blocks = {}              # (_filled_before) (source, z, x, y, export) -> its tiles on disk fill it
+        # (fetch_later's _known) key -> its decoded tile drew whole (_draws_whole), kept past the tile's time in _lru:
+        # without it a settled texture whose earlier source had left the LRU got a new token every quick build
+        self._whole = {}
         self._warm_want = []                # warm(): lazy tiles ahead of the player, nearest first
         self._warm_cv = threading.Condition()
         self._warm_thread = None
@@ -1378,7 +1384,8 @@ class Imagery:
 
     def _known(self, keys):
         """fetch_later's look before its batch, reading no file: {key: Tile or None} of the keys in memory (a coverage
-        probe in memory that says no data: None), _ON_DISK for a file on disk, None for a remembered 404."""
+        probe in memory that says no data: None), _ON_DISK for a file on disk (_WHOLE_ON_DISK: it drew whole when it
+        was decoded), None for a 404 remembered and still valid (an expired one is asked again, as _download does)."""
         out = {}
         with self._lock:
             for k in keys:
@@ -1392,8 +1399,8 @@ class Imagery:
             if k not in out:
                 jpg, miss = self._paths(*k)
                 if os.path.exists(jpg):
-                    out[k] = _ON_DISK
-                elif missindex.known(miss):
+                    out[k] = _WHOLE_ON_DISK if self._whole.get(k) else _ON_DISK
+                elif self.fetcher.miss_alive(miss, k[0].url):
                     out[k] = None
         return out
 
@@ -1729,6 +1736,9 @@ class Imagery:
                 del self._inflight[key]
             if not fut.cancelled() and fut.exception() is None:
                 self._lru[key] = fut.result()
+                if len(self._whole) > WHOLE_MEMO:
+                    self._whole.clear()
+                self._whole[key] = _draws_whole(fut.result())
                 while len(self._lru) > self.mem_tiles:
                     self._lru.popitem(last=False)
 

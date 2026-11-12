@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from concurrent import futures
 from dataclasses import replace
 from pathlib import Path
@@ -561,6 +562,29 @@ class ChainTest(unittest.TestCase):
                     self.assertLessEqual({r[2:] for r in ref.requests if r[0] == "eox2023"}, eox)
                     every = next(keys for _, s, _, keys, _ in im._needed(f, *sq, px, gutter) if s.name == "eox2023")
                     self.assertLess(len(eox), len(every), "before: all of them")
+
+    def test_fetch_later_settled_past_the_lru_and_expired_misses_asked_again(self):
+        """A settled quick texture gets no new token once its tiles left the memory LRU (their verdict is kept), and a
+        404 past its host's miss TTL is asked again (as a download would)."""
+        f = g.EnuFrame(LAT0, LON0)
+        sq, px = (-2048.0, -2048.0, 4096.0), 1024
+
+        def serve(name, z, x, y):
+            if name == "usgs" and z == 15 and x % 3 == 0:
+                return 404, b""
+            return self.tile(name, z, x, y)
+        im = FakeNet(self.tmp.name, serve, tone=0.0)
+        done = threading.Event()
+        im.add_img_listener(lambda token, changed: done.set())
+        self.assertEqual(len(im.fetch_later(f, *sq, px)), 1)
+        self.assertTrue(done.wait(10))
+        with im._lock:
+            im._lru.clear()
+        self.assertEqual(im.fetch_later(f, *sq, px), [], "settled: no new token after the LRU let go")
+        done.clear()
+        with mock.patch.object(im.fetcher, "miss_alive", return_value=False):
+            self.assertEqual(len(im.fetch_later(f, *sq, px)), 1, "an expired 404 is asked again")
+        self.assertTrue(done.wait(10))
 
     @staticmethod
     def idle(im, timeout=5.0):
