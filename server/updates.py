@@ -13,6 +13,7 @@ builds each push to the dev branch as the GitHub pre-release v<VERSION>.dev.<n> 
 1.7.2-beta, older than 1.7.3-beta). A copy that is one asks GitHub's releases list instead (pre-releases included),
 so it is told of the next development build or the next beta, whichever is newer.
 """
+import hashlib
 import json
 import os
 import re
@@ -76,11 +77,7 @@ def check(current, net=None):
         if rel is None or not newer(rel[0], current):
             return None
         return {"current": current, "latest": rel[0], "url": rel[1], "dev": is_dev(rel[0])}
-    try:
-        raw = net.get(LATEST_API, kind="background", headers={"Accept": "application/vnd.github+json"})
-        release = json.loads(raw.body.decode("utf-8", "replace"))
-    except (netfetch.FetchError, OSError, ValueError):
-        return None
+    release = github_json(net, LATEST_API, "background")
     if not isinstance(release, dict) or release.get("draft") or release.get("prerelease"):
         return None
     latest = str(release.get("tag_name") or "").removeprefix("v")
@@ -91,29 +88,72 @@ def check(current, net=None):
 
 
 RELEASES_API = f"https://api.github.com/repos/{REPO}/releases?per_page=30"
-RELEASES_TTL_S = 3 * 3600.0     # the releases list kept this long (api.github.com: a few requests a day, netfetch)
-_releases = [0.0, None]
-_releases_lock = threading.Lock()
+# GitHub's answers (releases/latest, the releases list) kept on disk, one copy a URL shared by the launcher, every
+# server process and every restart (addons.GitHubCache's way, in a folder of its own: the add-ons keep their own
+# lane and retries): asked again after TTL_S with If-None-Match; a 304 has no body and does not count against
+# GitHub's 60 requests an hour per address. (Before, 2026-11-12: releases/latest, 17 KB, asked after every hello and
+# at each launcher start; a development build's list, 584 KB, once a process every 3 h, in memory.) The default
+# cache folder, not the server's --cache-dir: the launcher asks before it knows that one.
+CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "beamng-earth", "updates")
+TTL_S = 3600.0
+
+
+def github_json(net, url, kind, fresh=False):
+    """GitHub's answer for url, parsed: the copy on disk while it is younger than TTL_S (fresh: asked again whatever
+    its age), else asked with its ETag (a 304: the copy, younger again). None when GitHub did not answer (the copy
+    does not stand in: offline is no update, as before) or the answer is not JSON."""
+    path = os.path.join(CACHE_DIR, hashlib.sha1(url.encode()).hexdigest()[:20] + ".json")
+    have = _read(path, url)
+    now = time.time()
+    if have is None or fresh or not 0 <= now - have["at"] < TTL_S:
+        headers = {"Accept": "application/vnd.github+json"}
+        if have and have.get("etag"):
+            headers["If-None-Match"] = have["etag"]
+        try:
+            r = net.get(url, kind=kind, headers=headers)
+        except (netfetch.FetchError, OSError):
+            return None
+        if r.status != 304 or have is None:
+            have = {"url": url, "etag": r.headers.get("etag", ""), "body": r.body.decode("utf-8", "replace")}
+        have["at"] = now
+        _write(path, have)
+    try:
+        return json.loads(have["body"])
+    except ValueError:
+        return None
+
+
+def _read(path, url):
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        if d.get("url") == url and isinstance(d.get("body"), str) and isinstance(d.get("at"), (int, float)):
+            return d
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
+
+
+def _write(path, d):
+    """(a temporary file of this writer's own, then renamed: the launcher and the server's processes may write at
+    once; no copy written is only a request more next time)"""
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
 
 
 def releases(net, fresh=False):
-    """GitHub's releases of the project (newest first, pre-releases included, drafts not), kept RELEASES_TTL_S; None
-    when GitHub did not answer."""
-    import json
-    with _releases_lock:
-        if not fresh and _releases[1] is not None and time.monotonic() - _releases[0] < RELEASES_TTL_S:
-            return _releases[1]
-    try:
-        r = net.get(RELEASES_API, kind="demand", headers={"Accept": "application/vnd.github+json"})
-        got = json.loads(r.body.decode("utf-8", "replace"))
-    except (netfetch.FetchError, OSError, ValueError):
-        return None
+    """GitHub's releases of the project (newest first, pre-releases included, drafts not), kept on disk (github_json;
+    fresh: asked again, a 304 when unchanged); None when GitHub did not answer."""
+    got = github_json(net, RELEASES_API, "demand", fresh)
     if not isinstance(got, list):
         return None
-    got = [x for x in got if isinstance(x, dict) and not x.get("draft")]
-    with _releases_lock:
-        _releases[:] = [time.monotonic(), got]
-    return got
+    return [x for x in got if isinstance(x, dict) and not x.get("draft")]
 
 
 def newest_release(net, fresh=False):

@@ -1,6 +1,7 @@
 """updates: the GitHub version check."""
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -18,22 +19,36 @@ def published(version="1.8.1", **changes):
 
 
 class FakeNet:
-    def __init__(self, body=None, err=None):
-        self.body, self.err, self.urls = body, err, []
+    """GitHub with one answer (ETag etag: a 304 without a body to a request that names it)."""
+
+    def __init__(self, body=None, err=None, etag='W/"e1"'):
+        self.body, self.err, self.etag, self.urls, self.headers = body, err, etag, [], []
 
     def get(self, url, kind="demand", headers=None):
         self.urls.append((url, kind))
+        self.headers.append(headers or {})
         if self.err:
             raise self.err
-
-        class R:
-            pass
-        r = R()
-        r.body = self.body.encode()
-        return r
+        if (headers or {}).get("If-None-Match") == self.etag:
+            return netfetch.Response(304, b"", {})
+        return netfetch.Response(200, self.body.encode(), {"etag": self.etag})
 
 
-class UpdatesTest(unittest.TestCase):
+class CacheCase(unittest.TestCase):
+    """Each test (and each new_cache()) with an empty folder for GitHub's answers on disk."""
+
+    def setUp(self):
+        self.new_cache()
+
+    def new_cache(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        p = mock.patch.object(updates, "CACHE_DIR", d.name)
+        p.start()
+        self.addCleanup(p.stop)
+
+
+class UpdatesTest(CacheCase):
     def test_newer(self):
         self.assertTrue(updates.newer("1.4.1-preview", "1.4.0-preview"))
         self.assertTrue(updates.newer("1.4.0", "1.4.0-preview"), "a release is newer than its preview")
@@ -59,7 +74,6 @@ class UpdatesTest(unittest.TestCase):
                 {"tag_name": "v1.7.2-beta.dev.11", "html_url": page + "v1.7.2-beta.dev.11", "prerelease": True},
                 {"tag_name": "v1.8.0-beta", "html_url": page + "v1.8.0-beta", "draft": True},
                 {"tag_name": "v1.7.2-beta", "html_url": page + "v1.7.2-beta"}]
-        updates._releases[:] = [0.0, None]
         net = FakeNet(json.dumps(rels))
         r = updates.check("1.7.2-beta.dev.11", net)
         self.assertEqual((r["latest"], r["url"], r["dev"]), ("1.7.2-beta.dev.12", page + "v1.7.2-beta.dev.12", True),
@@ -67,7 +81,6 @@ class UpdatesTest(unittest.TestCase):
         self.assertEqual(net.urls[0][0], updates.RELEASES_API)
         self.assertIsNone(updates.check("1.7.2-beta.dev.12", net), "up to date (the list kept: no second request)")
         self.assertEqual(len(net.urls), 1)
-        updates._releases[:] = [0.0, None]
         self.assertIsNone(updates.check("1.8.1", FakeNet(published())), "main channel checks its published release")
 
     def test_check(self):
@@ -77,11 +90,37 @@ class UpdatesTest(unittest.TestCase):
         self.assertEqual(r["url"], updates.PAGE_URL + "/tag/v1.8.1")
         self.assertEqual(net.urls[0], (updates.LATEST_API, "background"))
         self.assertIsNone(updates.check("1.8.1", FakeNet(published())), "up to date")
+        self.new_cache()
         self.assertIsNone(updates.check("1.4.0", FakeNet(err=netfetch.FetchError("offline"))), "offline: nothing")
         self.assertIsNone(updates.check(None, FakeNet("2.0.0")), "no local VERSION: nothing")
 
+    def test_answers_kept_on_disk_then_asked_with_their_etag(self):
+        """One copy for every process and restart (on disk): within TTL_S no request; after it If-None-Match, and the
+        304 (no body) gives the same answer; fresh asks again whatever the age. Offline after TTL_S: nothing."""
+        first = FakeNet(published())
+        self.assertEqual(updates.check("1.7.4-beta", first)["latest"], "1.8.1")
+        self.assertNotIn("If-None-Match", first.headers[0], "nothing on disk yet: a plain request")
+        later = FakeNet(published("9.9.9"))      # (another process, later: GitHub not asked)
+        self.assertEqual(updates.check("1.7.4-beta", later)["latest"], "1.8.1")
+        self.assertEqual(later.urls, [])
+        with mock.patch.object(updates, "TTL_S", 0.0):
+            stale = FakeNet(published("9.9.9"))     # (unchanged on GitHub: the same ETag, a 304)
+            self.assertEqual(updates.check("1.7.4-beta", stale)["latest"], "1.8.1", "304: the copy on disk")
+            self.assertEqual(stale.headers[0].get("If-None-Match"), 'W/"e1"')
+            new = FakeNet(published("1.8.2"), etag='W/"e2"')
+            self.assertEqual(updates.check("1.7.4-beta", new)["latest"], "1.8.2", "changed: GitHub's new answer")
+            self.assertIsNone(updates.check("1.7.4-beta", FakeNet(err=netfetch.FetchError("offline"))))
+        self.assertEqual(updates.check("1.7.4-beta", FakeNet(published("9.9.9")))["latest"], "1.8.2",
+                         "GitHub's new answer kept on disk")
+        fresh = FakeNet("[]", etag='W/"l1"')
+        updates.releases(fresh)
+        updates.releases(fresh, fresh=True)
+        self.assertEqual(len(fresh.urls), 2, "fresh (selfupdate): asked again ...")
+        self.assertEqual(fresh.headers[1].get("If-None-Match"), 'W/"l1"', "... with the ETag")
+
     def test_unpublished_main_version_is_not_an_update(self):
         self.assertIsNone(updates.check("1.7.4-beta", FakeNet("1.8.1\n")))
+        self.new_cache()
         self.assertIsNone(updates.check("1.7.4-beta", FakeNet(published("1.7.3"))))
 
     def test_ineligible_or_malformed_published_release_is_ignored(self):
@@ -89,6 +128,7 @@ class UpdatesTest(unittest.TestCase):
                      published(html_url="https://example.com/release"), published(tag_name="invalid"),
                      "[]", "null", "{}", "not JSON"):
             with self.subTest(body=body):
+                self.new_cache()
                 self.assertIsNone(updates.check("1.7.4-beta", FakeNet(body)))
 
 
