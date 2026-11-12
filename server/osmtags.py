@@ -139,6 +139,10 @@ class OsmTags:
                     m = rangeread.CONTENT_RANGE.match(r.headers.get("content-range", ""))
                     if not etag or not m or m.group(3) == "*":
                         raise rangeread.RangeError(f"{self.url}: no ETag or size")
+                except (netfetch.Deferred, netfetch.RateLimited):
+                    # (this server's own slots or budget, not the host: no marker, the next caller asks. Fuel's prefetch
+                    # shares the marker with the picnic tables' demand reads, which a marker turns off)
+                    raise
                 except Exception:
                     os.makedirs(os.path.dirname(down), exist_ok=True)
                     open(down, "w").close()

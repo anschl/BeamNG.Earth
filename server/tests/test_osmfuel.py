@@ -137,6 +137,27 @@ class OsmFuelVersionTest(unittest.TestCase):
         self.assertEqual(picnic.version()[1].cache_dir, fuel.version()[1].cache_dir)
 
 
+    def test_a_refused_prefetch_does_not_mark_the_host_unreachable(self):
+        import netfetch
+        import osmfuel
+        from types import SimpleNamespace
+
+        class Fetcher:
+            calls = 0
+
+            def get(self, url, kind=None, headers=None):
+                Fetcher.calls += 1
+                if kind == "prefetch":
+                    raise netfetch.Deferred("busy, prefetch dropped", url, "data.openstreetmap.us")
+                return SimpleNamespace(headers={"etag": '"v1"', "content-range": "bytes 0-15/9000000"})
+        d = tempfile.mkdtemp()
+        fuel, picnic = osmfuel.OsmFuel(d, Fetcher()), osmfuel.OsmFuel(d, Fetcher())
+        with self.assertRaises(netfetch.Deferred):
+            fuel.version("prefetch")
+        self.assertEqual(picnic.version("demand")[0], '"v1"', "the picnic tables' demand read still asks")
+        self.assertEqual(Fetcher.calls, 2)
+
+
 class OsmFuelReadTest(unittest.TestCase):
     """(2026-10-29: the start's index read turned away ten times, "bucket low, prefetch dropped") amenity = 'fuel' made
     DuckDB read the amenity column's bloom filter of every row group in the file, block by block (a game cell: 133 of
