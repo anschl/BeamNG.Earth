@@ -7866,7 +7866,8 @@ class Connection:
             pass
         try:
             res = await asyncio.get_running_loop().run_in_executor(
-                None, spacecloudsmod.build, self.s.out_dir, self.s.vfs_dir, frame, lat, lon, alt, self.s.net, sun)
+                None, spacecloudsmod.build, self.s.out_dir, self.s.vfs_dir, frame, lat, lon, alt, self.s.net, sun,
+                self.s.cache_dir, self.s.cache)
         except Exception as e:
             log.warning("space clouds: %s: %s", type(e).__name__, e)
             return

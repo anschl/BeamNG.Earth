@@ -6,6 +6,7 @@ import math
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 import numpy as np
@@ -78,6 +79,46 @@ class BuildTest(unittest.TestCase):
                 raise OSError("offline")
         with tempfile.TemporaryDirectory() as d:
             self.assertIsNone(spaceclouds.build(d, "/temp/x", geodesy.EnuFrame(0, 0), 0.0, 0.0, 50_000.0, Dead()))
+
+
+class TileCacheTest(unittest.TestCase):
+    """The tiles kept in the download cache: a second build asks nothing and makes the same images; cloud tiles older
+    than the host policy's cache_ttl are asked again, the lights (one fixed year) never."""
+
+    def build(self, cache, net):
+        out = tempfile.mkdtemp(dir=cache)
+        res = spaceclouds.build(out, "/temp/x", geodesy.EnuFrame(43.70, 7.27), 43.70, 7.27, 100_000.0, net,
+                                sun=(0.0, 7.27), cache_dir=cache)
+        out_files = {}
+        for k in ("color", "opacity", "lights"):
+            with open(os.path.join(out, os.path.basename(res[k])), "rb") as f:
+                out_files[k] = f.read()
+        return out_files
+
+    def test_kept_and_reused(self):
+        with tempfile.TemporaryDirectory() as cache:
+            net = FakeGibs()
+            first = self.build(cache, net)
+            n = len(net.asked)
+            self.assertGreater(n, 0)
+            self.assertTrue(os.path.isdir(os.path.join(cache, "imagery", spaceclouds.CLOUDS_DIR)))
+            self.assertTrue(os.path.isdir(os.path.join(cache, "imagery", spaceclouds.LIGHTS_DIR)))
+            self.assertEqual(self.build(cache, net), first)
+            self.assertEqual(len(net.asked), n, "the second build from the cache only")
+
+    def test_old_clouds_asked_again_lights_kept(self):
+        self.assertEqual(spaceclouds.CLOUDS_TTL_S, 3 * 3600.0)
+        with tempfile.TemporaryDirectory() as cache:
+            net = FakeGibs()
+            self.build(cache, net)
+            old = time.time() - spaceclouds.CLOUDS_TTL_S - 60
+            for dirpath, _, names in os.walk(os.path.join(cache, "imagery")):
+                for f in names:
+                    os.utime(os.path.join(dirpath, f), (old, old))
+            net.asked.clear()
+            self.build(cache, net)
+            self.assertTrue(net.asked)
+            self.assertTrue(all(spaceclouds.LAYER in u for u in net.asked), "only the clouds asked again")
 
 
 class SunTest(unittest.TestCase):

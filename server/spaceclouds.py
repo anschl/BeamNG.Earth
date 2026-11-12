@@ -7,17 +7,26 @@ on a curved shell SHELL_H_M up out to the horizon (earthfast.shell_lonlat), draw
 (spaceclouds.lua) only while the camera is that high.
 
 build(out_dir, vfs_dir, frame, lat, lon, cam_alt, fetcher) -> the message's fields, or None when no tile could be had.
-Kernels in Rust; this is the tiles' fetch, the mosaic's crop and the files."""
+Kernels in Rust; this is the tiles' fetch, the mosaic's crop and the files.
+
+The tiles are kept in the download cache (imagery/CLOUDS_DIR, LIGHTS_DIR; capped and evicted with the photos): the mod
+asks for a new shell every 15 min, and in orbit after every quarter of its reach (~80 s at the ISS's speed), and each
+build was ~130 cloud and ~130 lights tiles (z6 at 400 km, ~10 MB) from the network: an hour in orbit ~12,000 requests,
+twice GIBS's daily budget. Cloud tiles are kept CLOUDS_TTL_S (the host policy's cache_ttl), lights tiles for good."""
 import concurrent.futures
 import io
 import logging
 import math
 import os
+import threading
 import time
 
 import numpy as np
 
+import cache as cachemod
 import fast
+import netfetch
+import staging
 
 log = logging.getLogger("earthd.spaceclouds")
 
@@ -30,6 +39,12 @@ MAX_ZOOM = 9                # the layer's finest (~300 m a pixel at the equator)
 LIGHTS_URL = ("https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/VIIRS_Black_Marble/default/default/"
               "GoogleMapsCompatible_Level8/{z}/{y}/{x}.png")
 LIGHTS_MAX_ZOOM = 8
+# Their folders under the cache's imagery/. The clouds' URL has no date ("default": the latest day), so a kept tile is
+# the day of its download: kept the host policy's cache_ttl (3 h) and fetched again after it (a new day every ~24 h).
+# Black Marble is one fixed year: kept for good.
+CLOUDS_DIR = "gibs-viirs-truecolor"
+LIGHTS_DIR = "gibs-blackmarble-2016"
+CLOUDS_TTL_S = netfetch.POLICIES[netfetch.host_of(TILE_URL)].cache_ttl
 LIGHTS_H_M = 300.0
 TEX_PX = 2048               # the mosaic's side
 MAX_TILES = 144             # a coarser zoom past this many tiles
@@ -105,21 +120,54 @@ def merc_lat(y, z):
     return np.degrees(np.arctan(np.sinh(np.pi * (1 - 2 * np.asarray(y, np.float64) / n))))
 
 
-def mosaic(fetcher, z, x0, y0, x1, y1, url=TILE_URL, px=TEX_PX, kind="demand"):
+def _kept(disk, path, ttl):
+    """The bytes of a tile kept at path, or None (none there, or older than ttl s; ttl None: kept for good)."""
+    try:
+        if ttl is not None and time.time() - os.path.getmtime(path) >= ttl:
+            return None
+    except OSError:
+        return None
+    return disk.read(path)
+
+
+def _keep(disk, path, body):
+    """A fetched tile's bytes written to path atomically (imagery's tiles' way); a failed write only logged."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{threading.get_ident()}.tmp"
+        with open(tmp, "wb") as f:
+            f.write(body)
+        staging.replace_cached(tmp, path)
+        disk.wrote(path, len(body))
+    except OSError as e:
+        log.debug("space clouds: tile not kept %s: %s", path, e)
+
+
+def mosaic(fetcher, z, x0, y0, x1, y1, url=TILE_URL, px=TEX_PX, kind="demand", store=None, ttl=None, disk=None):
     """The (px, px, 3) uint8 image of the global pixel box at zoom z from the layer's tiles (black where a tile could
-    not be had), and how many tiles came (globe.py: the whole world from EOX)."""
+    not be had), and how many tiles came (globe.py: the whole world from EOX). store: a folder the tiles are kept in
+    (<z>/<x>/<y>.<ext>) and taken from while younger than ttl s (None: for good); disk: the cache's bookkeeping."""
     from PIL import Image
     tx0, tx1 = int(math.floor(x0 / 256)), int(math.floor(x1 / 256))
     ty0, ty1 = int(math.floor(y0 / 256)), int(math.floor(y1 / 256))
     n = 2 ** z
     canvas = np.zeros(((ty1 - ty0 + 1) * 256, (tx1 - tx0 + 1) * 256, 3), np.uint8)
+    disk = disk if disk is not None else cachemod.NONE
+    ext = os.path.splitext(url)[1]
 
     def one(tx, ty):
         if not 0 <= ty < n:
             return tx, ty, None
+        path = os.path.join(store, str(z), str(tx % n), f"{ty}{ext}") if store else None
         try:
-            body = fetcher.get(url.format(z=z, x=tx % n, y=ty), kind=kind).body
-            return tx, ty, np.asarray(Image.open(io.BytesIO(body)).convert("RGB"))
+            body = _kept(disk, path, ttl) if path else None
+            fresh = body is None
+            if fresh:
+                body = fetcher.get(url.format(z=z, x=tx % n, y=ty), kind=kind).body
+            im = np.asarray(Image.open(io.BytesIO(body)).convert("RGB"))
+            if fresh and path:              # (kept once it decodes: a bad body is asked for again next time)
+                _keep(disk, path, body)
+            return tx, ty, im
         except Exception as e:          # (a tile the day has no pass over yet, offline: no clouds there)
             log.debug("space clouds tile %s/%s/%s: %s", z, tx, ty, e)
             return tx, ty, None
@@ -136,15 +184,16 @@ def mosaic(fetcher, z, x0, y0, x1, y1, url=TILE_URL, px=TEX_PX, kind="demand"):
     return np.asarray(crop if crop.size == (px, px) else crop.resize((px, px), Image.BILINEAR)), got
 
 
-def build(out_dir, vfs_dir, frame, lat0, lon0, cam_alt, fetcher, sun=None):
+def build(out_dir, vfs_dir, frame, lat0, lon0, cam_alt, fetcher, sun=None, cache_dir=None, disk=None):
     """Write the cloud shell (shape, colour and opacity DDS) for a camera cam_alt m over (lat0, lon0) into out_dir;
-    the 'space_clouds' message's fields (game paths under vfs_dir, the material's name), or None without any tile."""
+    the 'space_clouds' message's fields (game paths under vfs_dir, the material's name), or None without any tile.
+    cache_dir: the download cache's root, its tiles kept there (None: none kept); disk: its bookkeeping (cache.py)."""
     import cdae
     import imagery
     fast.require(151, "space clouds")
     radius = radius_for(cam_alt)
     z, x0, y0, x1, y1 = pick_zoom(lat0, lon0, radius)
-    img, got = mosaic(fetcher, z, x0, y0, x1, y1)
+    img, got = mosaic(fetcher, z, x0, y0, x1, y1, store=_store(cache_dir, CLOUDS_DIR), ttl=CLOUDS_TTL_S, disk=disk)
     if not got:
         return None
     col, op = fast._ef.cloud_layer(np.ascontiguousarray(img))
@@ -170,20 +219,26 @@ def build(out_dir, vfs_dir, frame, lat0, lon0, cam_alt, fetcher, sun=None):
     out = {"shape": f"{vfs_dir}/{name}.cdae", "color": f"{vfs_dir}/{name}_c.dds", "opacity": f"{vfs_dir}/{name}_o.dds",
            "material": material, "lat": float(lat0), "lon": float(lon0), "radius": float(radius)}
     try:
-        out.update(_lights(out_dir, vfs_dir, frame, name, ll, tris, z, x0, y0, x1, y1, fetcher, sun))
+        out.update(_lights(out_dir, vfs_dir, frame, name, ll, tris, z, x0, y0, x1, y1, fetcher, sun, cache_dir, disk))
     except Exception as e:                  # (the clouds without the lights)
         log.debug("space clouds: night lights: %s: %s", type(e).__name__, e)
     return out
 
 
-def _lights(out_dir, vfs_dir, frame, name, ll, tris, z, x0, y0, x1, y1, fetcher, sun=None):
+def _store(cache_dir, name):
+    """A layer's tile folder in the download cache, or None without one."""
+    return os.path.join(cache_dir, "imagery", name) if cache_dir else None
+
+
+def _lights(out_dir, vfs_dir, frame, name, ll, tris, z, x0, y0, x1, y1, fetcher, sun=None, cache_dir=None, disk=None):
     """The night-lights shell over the clouds' box: Black Marble at zoom min(z, LIGHTS_MAX_ZOOM), the lit pixels where
     the sun is down (sun: its (lat, lon) subsolar point, the game's; None: the real one now); {} without any tile."""
     import cdae
     import imagery
     zl = min(z, LIGHTS_MAX_ZOOM)
     k = 2.0 ** (zl - z)
-    img, got = mosaic(fetcher, zl, x0 * k, y0 * k, x1 * k, y1 * k, LIGHTS_URL)
+    img, got = mosaic(fetcher, zl, x0 * k, y0 * k, x1 * k, y1 * k, LIGHTS_URL, store=_store(cache_dir, LIGHTS_DIR),
+                      disk=disk)
     if not got:
         return {}
     rows = y0 * k + (np.arange(TEX_PX) + 0.5) * (y1 - y0) * k / TEX_PX
