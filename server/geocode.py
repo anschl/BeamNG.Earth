@@ -144,6 +144,10 @@ _pool = concurrent.futures.ThreadPoolExecutor(8, thread_name_prefix="place-searc
 _lock = threading.Lock()
 _cache = {}                     # url -> (time.monotonic(), parsed JSON)
 _skip = {}                      # source -> time.monotonic() it may be asked again
+# The searches so far. The map keeps only its last search's answer (EarthMap.vue searchSeq), so a search that a newer
+# one has overtaken (the player typed on) asks no second round (variants): up to ~10 requests nobody would see. One
+# count for the process: a server has one player (the mod of the game on this computer).
+_searches = [0]
 
 # Wikipedia's language for a country (netfetch.WIKIPEDIA_LANGS: its hosts have a policy); en is always asked.
 WIKI_LANG_OF_COUNTRY = {
@@ -205,32 +209,31 @@ def wikidata_search_url(q, lang):
         "format": "json"})
 
 
-def wikidata_items_url(ids, lang):
+# The search's items' places: GeoData's primary coordinate of each (P625's best statement), ~0.2 KB. It replaced
+# wbgetentities' claims, which carry every statement of an item to read one: 0.1-2 MB for six hits ("Berlin" 0.55 MB,
+# six large cities 2 MB), on every search as the player types. The names and descriptions come with the search's own
+# answer (wbsearchentities: in the language asked, through its fallbacks to English).
+def wikidata_coords_url(ids):
     return WIKIDATA_URL + "?" + urllib.parse.urlencode({
-        "action": "wbgetentities", "ids": "|".join(ids), "props": "claims|labels|descriptions",
-        "languages": lang if lang == "en" else lang + "|en", "format": "json"})
+        "action": "query", "prop": "coordinates", "titles": "|".join(ids), "coprimary": "primary", "colimit": "max",
+        "format": "json", "formatversion": 2})
 
 
-def parse_wikidata(data, ids, lang):
-    """The items of a wbgetentities answer that have a place on Earth, in the order of ids. Pure."""
+def parse_wikidata(found, coords):
+    """The items of a wbsearchentities answer's "search" list (found) that have a place on Earth in coords (the
+    GeoData answer for their ids), in the search's order. Pure."""
+    pages = {p.get("title"): p for p in ((coords or {}).get("query") or {}).get("pages") or []}
     out = []
-    entities = (data or {}).get("entities") or {}
-    for rank, qid in enumerate(ids, 1):
-        e = entities.get(qid) or {}
-        try:
-            v = e["claims"]["P625"][0]["mainsnak"]["datavalue"]["value"]
-            if not str(v.get("globe", "")).endswith("/Q2"):
-                continue
-            lat, lon = float(v["latitude"]), float(v["longitude"])
-        except (KeyError, IndexError, TypeError, ValueError):
+    for rank, x in enumerate((x for x in found if x.get("id")), 1):
+        c = ((pages.get(str(x["id"])) or {}).get("coordinates") or [None])[0]
+        if not c or c.get("globe", "earth") != "earth" or not x.get("label"):
             continue
-
-        def text(field):
-            values = e.get(field) or {}
-            return (values.get(lang) or values.get("en") or {}).get("value") or ""
-        if text("labels"):
-            out.append({"name": text("labels"), "detail": text("descriptions"), "kind": "wikidata",
-                        "lat": round(lat, 6), "lon": round(lon, 6), "rank": rank})
+        try:
+            lat, lon = float(c["lat"]), float(c["lon"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        out.append({"name": x["label"], "detail": x.get("description") or "", "kind": "wikidata",
+                    "lat": round(lat, 6), "lon": round(lon, 6), "rank": rank})
     return out
 
 
@@ -290,7 +293,7 @@ def _wikipedia(net, q, lang):
 def _wikidata(net, q, lang):
     found = (_json(net, wikidata_search_url(q, lang)) or {}).get("search") or []
     ids = [str(x["id"]) for x in found if x.get("id")]
-    return parse_wikidata(_json(net, wikidata_items_url(ids, lang)), ids, lang) if ids else []
+    return parse_wikidata(found, _json(net, wikidata_coords_url(ids))) if ids else []
 
 
 def _nominatim(net, q, lat, lon, lang, near=False):
@@ -511,6 +514,9 @@ def search(q, lat=None, lon=None, net=None, country=None, full=False):
     """Results for q (blocking; [] for a short query), best first: [{name, detail, kind, lat, lon, score}]. full: the
     player pressed Enter, so the sources that may not be asked while typing are asked too. Raises what the sources
     raised (netfetch.FetchError) only when every one of them failed and there is nothing to show."""
+    with _lock:
+        _searches[0] += 1
+        mine = _searches[0]
     q = (q or "").strip()
     if len(q) < MIN_CHARS:
         return []
@@ -536,7 +542,7 @@ def search(q, lat=None, lon=None, net=None, country=None, full=False):
         jobs["wikipedia " + w] = (_wikipedia, (net, q, w))
     results, errors, late = _ask(jobs, deadline)
     asked = len(jobs)
-    if not any(fits(q, r) >= WEAK for r in results):
+    if not any(fits(q, r) >= WEAK for r in results) and _searches[0] == mine:
         more = {}
         for v in variants(q):
             more["wikidata " + v] = (_wikidata, (net, v, shown))

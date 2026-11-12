@@ -164,11 +164,24 @@ class SourcesTest(unittest.TestCase):
         self.assertEqual([x["name"] for x in r], ["Ganter Bridge"])
 
     def test_wikidata_in_the_search_order(self):
-        def item(label, globe="http://www.wikidata.org/entity/Q2"):
-            return {"labels": {"en": {"value": label}}, "claims": {"P625": [{"mainsnak": {"datavalue": {"value": {
-                "latitude": 1.0, "longitude": 2.0, "globe": globe}}}}]}}
-        data = {"entities": {"Q1": item("b"), "Q2": item("a"), "Q3": item("moon", "x/Q405"), "Q4": {"labels": {}}}}
-        self.assertEqual([x["name"] for x in geocode.parse_wikidata(data, ["Q2", "Q1", "Q3", "Q4"], "de")], ["a", "b"])
+        # (the names from the search's answer, the places from GeoData's: wbgetentities' claims were 0.1-2 MB a search)
+        found = [{"id": "Q2", "label": "a", "description": "da"}, {"id": "Q1", "label": "b"},
+                 {"id": "Q3", "label": "moon"}, {"id": "Q4", "label": "no place"}, {"id": "Q5"}]
+        coords = {"query": {"pages": [
+            {"title": t, "coordinates": [{"lat": 1.0, "lon": 2.0, "primary": True, "globe": g}]}
+            for t, g in (("Q1", "earth"), ("Q3", "moon"), ("Q2", "earth"), ("Q5", "earth"))] + [{"title": "Q4"}]}}
+        r = geocode.parse_wikidata(found, coords)
+        self.assertEqual([(x["name"], x["detail"], x["rank"]) for x in r], [("a", "da", 1), ("b", "", 2)])
+
+    def test_wikidata_asks_only_the_coordinates_of_the_hits(self):
+        net = Answers({"wbsearchentities": json.dumps({"search": [{"id": "Q378688", "label": "Ganterbrücke"}]}).encode(),
+                       "prop=coordinates": json.dumps({"query": {"pages": [{"title": "Q378688", "coordinates": [
+                           {"lat": 46.296372, "lon": 8.050861, "primary": True, "globe": "earth"}]}]}}).encode()})
+        self.assertEqual([(r["name"], r["lat"]) for r in geocode._wikidata(net, "Ganterbrücke", "de")],
+                         [("Ganterbrücke", 46.296372)])
+        q = parse_qs(urlparse(net.urls[-1]).query)
+        self.assertEqual((q["titles"], q["coprimary"]), (["Q378688"], ["primary"]))
+        self.assertFalse([u for u in net.urls if "wbgetentities" in u])
 
     def test_nominatim_labels(self):
         r = geocode.parse_nominatim([{"lat": "51.0", "lon": "9.2", "name": "", "type": "house", "display_name": "x",
@@ -228,6 +241,22 @@ class SourcesTest(unittest.TestCase):
     def test_two_words_are_also_asked_as_one_and_alone(self):
         self.assertEqual(geocode.variants("Felsenau Viadukt"), ["Felsenauviadukt", "Felsenau", "Viadukt"])
         self.assertEqual(geocode.variants("Ganterbrücke"), [])
+
+    def test_an_overtaken_search_asks_no_variants(self):
+        """The map drops a search's answer once the player typed on: its second round would go unseen."""
+        net = Answers({})
+        geocode.search("Felsenau Viadukt", net=net)
+        self.assertTrue([u for u in net.urls if "Felsenauviadukt" in u], "nothing found: the variants are asked")
+
+        class TypedOn(Answers):
+            def get(self, url, kind="demand", lane=None):
+                geocode.search("Fe")            # (a newer search arrives while the first round is out)
+                return super().get(url, kind, lane)
+        geocode._cache.clear()
+        net = TypedOn({})
+        geocode.search("Felsenau Viadukt", net=net)
+        self.assertTrue(net.urls)
+        self.assertFalse([u for u in net.urls if "Felsenauviadukt" in u])
 
     def test_names_in_the_players_language_abroad(self):
         net = Answers({})
