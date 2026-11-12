@@ -381,9 +381,12 @@ class LandLookupTest(unittest.TestCase):
             md.fetcher.gate.set()
             ts.join(10)
             self.assertAlmostEqual(float(outs["r"][0][0]), -FakeBathy.BATHY, places=1)
-            ref = seacarve.SeaCarver(BathyMapData(), d2).water(*land)
+            rsc = seacarve.SeaCarver(BathyMapData(), d2)
+            ref = rsc.water(*land)
             for a, b in zip(out["r"], ref):
                 np.testing.assert_array_equal(a, b)
+            if rsc._full_ex is not None:        # (its build with the sea floor, in the background: done before d2 goes)
+                rsc._full_ex.shutdown(wait=True)
             self.assertFalse(sc._land, "the whole raster replaced the one without bathymetry")
             self.assertEqual(md.calls, calls, "built with the bathymetry from the first build's state, not again")
 
@@ -406,6 +409,38 @@ class PrefetchTest(unittest.TestCase):
             other = seacarve.SeaCarver(FakeMapData(fail=True), d)
             self.assertAlmostEqual(float(other.depth(np.array([south(100)]), np.array([LON0]))[0]), -FakeBathy.BATHY,
                                    places=1)
+
+
+class AcrossProcessesTest(unittest.TestCase):
+    def test_one_process_asks_noaa(self):
+        """Two carvers on one cache (the main process's prefetch and a block worker's): the cell is built with its sea
+        floor by the first, the second waits for its file instead of asking NOAA again (exact repeats: 4 MB Hartford,
+        6 MB San Francisco, 2026-11-12)."""
+        import threading
+        with tempfile.TemporaryDirectory() as d:
+            first, second = BathyMapData(), BathyMapData()
+            first.fetcher = GatedBathy()
+            mx, my = seacarve._merc(np.array([south(100)]), np.array([LON0]))
+            k = (int(mx[0] // seacarve.CELL_PX), int(my[0] // seacarve.CELL_PX))
+            a, b = seacarve.SeaCarver(first, d), seacarve.SeaCarver(second, d)
+            out = {}
+            ta = threading.Thread(target=lambda: out.setdefault("a", a.raster(*k)), daemon=True)
+            ta.start()
+            while not os.path.exists(a._path(*k) + ".lock") and ta.is_alive():
+                threading.Event().wait(0.01)
+            tb = threading.Thread(target=lambda: out.setdefault("b", b.raster(*k)), daemon=True)
+            tb.start()
+            tb.join(0.3)
+            self.assertTrue(tb.is_alive(), "waits for the first's build")
+            first.fetcher.gate.set()
+            ta.join(10)
+            tb.join(10)
+            self.assertEqual((first.fetcher.calls, second.fetcher.calls), (1, 0), "NOAA asked once")
+            for x, y in zip(out["a"], out["b"]):
+                np.testing.assert_array_equal(x, y)
+            self.assertFalse(os.path.exists(a._path(*k) + ".lock"), "released")
+            del out, a, b
+            gc.collect()        # (the raw copy's mapping closed: Windows deletes no mapped file)
 
 
 class LakeTest(unittest.TestCase):

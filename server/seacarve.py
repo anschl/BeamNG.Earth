@@ -32,6 +32,7 @@ import mapcells
 import pacer
 import cache as cachemod
 import staging
+import xproc
 
 log = logging.getLogger("earthd.seacarve")
 
@@ -459,6 +460,27 @@ class SeaCarver:
 
     def _load(self, x, y, with_bathy=True):
         p = self._path(x, y)
+        got = self._from_disk(x, y, p)
+        if got is not None:
+            return got
+        mine = False
+        if p and with_bathy:
+            # (one process builds a cell with its sea floor, the others wait for its file: the main process's prefetch
+            # and every block worker's own carver locked only within their process, and a worker missing the cell
+            # asked NOAA for it again while main's request was still queued; exact repeats 4 MB at Hartford, 6 MB at
+            # San Francisco, 2026-11-12; NOAA is the most limited host, 1/s and 4000 a day. A build without its sea
+            # floor writes no file: the next one builds it.)
+            got, mine = xproc.once(p + ".lock", lambda: self._from_disk(x, y, p), xproc.STALE_S)
+            if got is not None:
+                return got
+        try:
+            return self._build_kept(x, y, p, with_bathy)
+        finally:
+            if mine:
+                xproc.release(p + ".lock")
+
+    def _from_disk(self, x, y, p):
+        """(raster, True) of cell (x, y) from its files at p (the raw copy, else the npz), or None when not there."""
         raw = _raw_path(p)
         if raw and os.path.exists(raw):
             try:
@@ -476,6 +498,11 @@ class SeaCarver:
                 if r is not None:       # (outside the read: its raw copy failing to write is no damaged cell file)
                     self._second_use(x, y, raw, r)
                 return r, True
+        return None
+
+    def _build_kept(self, x, y, p, with_bathy):
+        """(raster, complete) of cell (x, y) built, written to p when complete."""
+        raw = _raw_path(p)
         r = self._build(x, y, with_bathy)
         complete = r is None or r[3]
         if r is not None:
