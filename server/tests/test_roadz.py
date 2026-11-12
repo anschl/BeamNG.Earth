@@ -357,6 +357,35 @@ class PartsTest(unittest.TestCase):
             provider()._read("USGS_X", ["1-0-0-0"], boxes, mapcells.CellKey(14, 4685, 6266))
             self.assertEqual(len(asked), 2)
 
+    def test_a_hierarchy_page_two_readers_ask_for_is_downloaded_once(self):
+        """Two readers (threads; other processes take the same lock file) ask for the same hierarchy page at once: one
+        downloads it, the other waits for its file and reads it (RoadZ._ept_json)."""
+        import tempfile
+        import threading
+        with tempfile.TemporaryDirectory() as d:
+            asked = []
+            rz = roadz.RoadZ(d, None)
+
+            def fetch(url, headers=None, lane=None):
+                asked.append(url)
+                time.sleep(0.3)                     # (the download under way while the other reader asks)
+                return b'{"0-0-0-0": 10, "1-0-0-0": -1}'
+            rz._fetch = fetch
+            got = [None, None]
+
+            def read(i):
+                got[i] = rz._ept_json("USGS_X/ept-hierarchy/0-0-0-0.json")
+            ts = [threading.Thread(target=read, args=(i,)) for i in (0, 1)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+            self.assertEqual(len(asked), 1)
+            self.assertEqual(got[0], {"0-0-0-0": 10, "1-0-0-0": -1})
+            self.assertEqual(got[0], got[1])
+            self.assertEqual(os.listdir(os.path.join(rz.dir, "ept", "USGS_X", "ept-hierarchy")), ["0-0-0-0.json"],
+                             "no lock, no tmp")
+
     def test_kept_nodes_capped(self):
         """The kept nodes cut back to NODES_MB, the least recently read first."""
         import tempfile

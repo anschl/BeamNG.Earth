@@ -1005,13 +1005,32 @@ class RoadZ:
         return e
 
     def _ept_json(self, rel):
+        """An EPT file (ept.json, a hierarchy page) of rel: the disk copy, or downloaded by one of the server's
+        processes and threads and kept. Its claim is a lock file beside the copy, waited for as a node's (_node_kept,
+        _await_part): the warm and the block processes' cell threads open the same dataset at once, and each downloaded
+        its pages until one had written them (cold-cache run 2026-11-12: 173 of 892 hierarchy URLs and an ept.json
+        fetched 2-3 times within 1.5 s, by threads of one process and by other processes; 214 extra requests)."""
         p = os.path.join(self.dir, "ept", rel) if self.dir else None
-        if p and os.path.exists(p):
-            with open(p, encoding="utf-8") as fh:
-                return json.load(fh)
-        body = self._fetch(EPT_BASE + rel)
-        d = json.loads(body.decode("utf-8"))
-        if p:
+        if p is None:
+            return json.loads(self._fetch(EPT_BASE + rel).decode("utf-8"))
+
+        def kept():
+            try:
+                with open(p, encoding="utf-8") as fh:
+                    return json.load(fh)
+            except FileNotFoundError:
+                return None
+        d = kept()
+        if d is not None:
+            return d
+        mine = False
+        if PART_CLAIMS:
+            got, mine = _await_part(p + ".lock", p)
+            if got is not None and (d := kept()) is not None:
+                return d
+        try:
+            body = self._fetch(EPT_BASE + rel)
+            d = json.loads(body.decode("utf-8"))
             import staging
             os.makedirs(os.path.dirname(p), exist_ok=True)
             # (a name of its own: a cell's neighbours read the same EPT file from threads of their own, and on Windows
@@ -1020,6 +1039,9 @@ class RoadZ:
             with open(tmp, "wb") as fh:
                 fh.write(body)
             staging.replace_cached(tmp, p)
+        finally:
+            if mine:
+                xproc.release(p + ".lock")
         return d
 
     def _bridges(self, key):
