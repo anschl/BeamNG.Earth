@@ -785,8 +785,9 @@ class RoadZ:
                     break
             ev.wait(60.0)
             with self._lock:
-                if key not in self._raw and self._raw_flight.get(key) is ev:
-                    return self._node_kept(name, k)     # (the reader hangs: our own read)
+                stuck = key not in self._raw and self._raw_flight.get(key) is ev
+            if stuck:                   # (the reader hangs: our own read, outside the lock: _fetch takes it)
+                return self._node_kept(name, k)
         try:
             body = self._node_kept(name, k)
             with self._lock:
