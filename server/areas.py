@@ -68,8 +68,9 @@ CELL_RING = 2               # cells round the box (roads, bridges and buildings 
 # first cell is built (CellTiles): such a block is one stretch of a PMTiles archive (Hilbert order), so its tiles come
 # in a few range reads instead of about one a cell and theme (a synthetic archive, 2026-11-12: 16 x 16 cells 295 reads
 # cell by cell, 38 in 16 x 16 blocks, as many as the whole area at once; 59 in 8 x 8 blocks, the reads round each
-# block's edge most of them: test_pmtiles AreaTilesTest)
-TILE_BLOCK = 4
+# block's edge most of them: test_pmtiles AreaTilesTest). 8 x 8: the progress waits for a block's download before its
+# first cell (a dense city's 16 x 16 block, ~300 MB, held it still for minutes on a slow line).
+TILE_BLOCK = 3
 TILE_READS_FAST = 4         # fast mode: a block's range reads at once (each mirror's netfetch max_conc still holds)
 DEM_ZOOMS_FAR = (12, 13, 14)    # the far rings' and the ground filter's zooms (dem.GLOBAL_ZOOM ..)
 DEM_RING = 1                # z12 tiles round the box (the ground filter's neighbours)
