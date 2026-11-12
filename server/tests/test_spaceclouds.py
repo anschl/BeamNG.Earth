@@ -120,6 +120,22 @@ class TileCacheTest(unittest.TestCase):
             self.assertTrue(net.asked)
             self.assertTrue(all(spaceclouds.LAYER in u for u in net.asked), "only the clouds asked again")
 
+    def test_a_damaged_kept_tile_is_fetched_again(self):
+        """A kept tile that does not decode (a write cut short) is dropped and fetched again, the lights too (kept for
+        good, they would otherwise stay a hole in every shell)."""
+        with tempfile.TemporaryDirectory() as cache:
+            net = FakeGibs()
+            first = self.build(cache, net)
+            lights = os.path.join(cache, "imagery", spaceclouds.LIGHTS_DIR)
+            bad = next(os.path.join(d, f) for d, _, fs in os.walk(lights) for f in fs)
+            with open(bad, "wb") as f:
+                f.write(b"cut short")
+            net.asked.clear()
+            self.assertEqual(self.build(cache, net), first)
+            self.assertEqual(len(net.asked), 1, "the damaged tile alone")
+            self.build(cache, net)
+            self.assertEqual(len(net.asked), 1, "kept again once it decoded")
+
 
 class SunTest(unittest.TestCase):
     def test_subsolar(self):

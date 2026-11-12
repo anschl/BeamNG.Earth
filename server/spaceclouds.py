@@ -143,6 +143,14 @@ def _keep(disk, path, body):
         log.debug("space clouds: tile not kept %s: %s", path, e)
 
 
+def _drop(disk, path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    disk.forget(path)
+
+
 def mosaic(fetcher, z, x0, y0, x1, y1, url=TILE_URL, px=TEX_PX, kind="demand", store=None, ttl=None, disk=None):
     """The (px, px, 3) uint8 image of the global pixel box at zoom z from the layer's tiles (black where a tile could
     not be had), and how many tiles came (globe.py: the whole world from EOX). store: a folder the tiles are kept in
@@ -161,11 +169,15 @@ def mosaic(fetcher, z, x0, y0, x1, y1, url=TILE_URL, px=TEX_PX, kind="demand", s
         path = os.path.join(store, str(z), str(tx % n), f"{ty}{ext}") if store else None
         try:
             body = _kept(disk, path, ttl) if path else None
-            fresh = body is None
-            if fresh:
-                body = fetcher.get(url.format(z=z, x=tx % n, y=ty), kind=kind).body
+            if body is not None:
+                try:
+                    return tx, ty, np.asarray(Image.open(io.BytesIO(body)).convert("RGB"))
+                except Exception as e:  # (a damaged copy, a write cut short: dropped and fetched again; the lights
+                    log.debug("space clouds: kept tile %s dropped: %s", path, e)    # are kept for good)
+                    _drop(disk, path)
+            body = fetcher.get(url.format(z=z, x=tx % n, y=ty), kind=kind).body
             im = np.asarray(Image.open(io.BytesIO(body)).convert("RGB"))
-            if fresh and path:              # (kept once it decodes: a bad body is asked for again next time)
+            if path:                    # (kept once it decodes: a bad body is asked for again next time)
                 _keep(disk, path, body)
             return tx, ty, im
         except Exception as e:          # (a tile the day has no pass over yet, offline: no clouds there)
