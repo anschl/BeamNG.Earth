@@ -159,6 +159,12 @@ AWS = dict(name="aws-terrarium", ext="png", size=256,
 # OSError 28 in 7 days, one line of earthd). MEM_MISSES: 404s kept so at most.
 MEM_RAW_BYTES = 96 * 1024 * 1024
 MEM_MISSES = 200000
+# Mapterhorn tiles a HEAD found (Dem._exists: the lidar test), one line "<y> <unix s>" per tile in their column's file
+# of this name (missindex.py's format and appends: cross-process, kept over restarts; their 404s go to the miss index
+# as a download's do). The test downloaded two z13 tiles (~100 KB each) per z12 tile only to learn whether they exist;
+# on a cold cache those were 13 MB at Lone Pine (most of its traffic with the car standing), 16 MB Hartford, 8 MB
+# Amsterdam, 26 MB Lyon, nothing else reading them (2026-11-12). Mapterhorn ignores Range but answers HEAD (200 / 404).
+HAS_NAME = "_has"
 # Mapterhorn's z0-12 from the project's own tile host (cdn.py; the data repo's dem workflow, tools/build_mt_packs.py):
 # planet.pmtiles' tiles repacked as they are (the same bytes as tiles.mapterhorn.com: compared tile for tile, 2026-11-11)
 # into packs of 8 x 8 (tilepack.py; zooms 0-2 one pack each), so one request is 64 tiles and the Mapterhorn endpoint
@@ -268,7 +274,7 @@ class Dem:
         # raw Mapterhorn downloads started ahead of need (_ahead): a fresh place's tiles walked z16 -> z15 -> z14 ->
         # z13 -> z12 and its 8 neighbours one request at a time, ~1 s each before the CDN has them (2026-10-22)
         self.probe_pool = ThreadPoolExecutor(PROBE_WORKERS, thread_name_prefix="dem-probe")
-        self._probing = {}              # (z, x, y) -> Future of its raw download
+        self._probing = {}              # (z, x, y) -> Future of its raw download; ("head", z, x, y): of _exists
         self._local = threading.local()
         self.mem_tiles = MEM_TILES if mem_tiles is None else mem_tiles
         self._lru = OrderedDict()       # (z, x, y) -> float32 [TILE, TILE]
@@ -605,6 +611,54 @@ class Dem:
         self._count(src["name"] + ":net")
         return data
 
+    def _exists(self, z, x, y, kind="demand"):
+        """Has Mapterhorn tile (z, x, y), without downloading it: _download's answer (the bytes or None) as a bool. On
+        disk or in memory: True; unlisted or a remembered 404: False; a HEAD's answer remembered (HAS_NAME), else a
+        HEAD (a 404 remembered as _download's). Raises netfetch.FetchError when the host cannot answer."""
+        name = MAPTERHORN["name"]
+        if z > GLOBAL_ZOOM and not self._listed(z, x, y):
+            self._count(name + ":unlisted")
+            return False
+        path = self._path(MAPTERHORN, z, x, y)
+        if os.path.exists(path):
+            return True
+        mk = (name, z, x, y)
+        if self._mem_raw or self._mem_miss:
+            with self._lock:
+                if mk in self._mem_raw:
+                    return True
+                if mk in self._mem_miss:
+                    return False
+        col = os.path.dirname(path)
+        miss = os.path.join(col, f"{y}{missindex.SUFFIX}")
+        url = MAPTERHORN["url"].format(z=z, x=x, y=y)
+        if self.fetcher.miss_alive(miss, url):
+            return False
+        has = os.path.join(col, HAS_NAME)
+        try:
+            with open(has, "rb") as f:
+                if y in missindex.parse(f.read()):
+                    return True
+        except OSError:
+            pass
+        try:
+            self.fetcher.head(url, kind=kind)
+        except netfetch.NotFound:
+            self._remember_miss([(mk, miss)])
+            self._count(name + ":404")
+            return False
+        except netfetch.FetchError:
+            self._count(name + ":error")
+            raise
+        try:
+            missindex._append(has, f"{y} {time.time():.0f}\n".encode())
+            self.disk.wrote(has)
+            missindex.clear(miss, self.disk)    # an expired miss: the host has data there now
+        except OSError:
+            pass                                # (asked again next time)
+        self._count(name + ":head")
+        return True
+
     def _keep(self, mk, path, data):
         """Downloaded tile bytes written to the disk cache; when that fails (a full disk, a folder that cannot be
         written) kept in this process's memory instead (MEM_RAW_BYTES, the oldest dropped), so the tile is not failed
@@ -800,27 +854,29 @@ class Dem:
         self._count("bngmt:net")
         return out
 
-    def _ahead(self, keys):
+    def _ahead(self, keys, head=False):
         """Start the raw Mapterhorn downloads of keys at once (on disk afterwards, or a remembered 404); one request
-        per tile however many ask. Returns their futures (result: the bytes or None; errors are left for the caller's
-        own _download to meet)."""
+        per tile however many ask. head: only whether they exist (_exists: a HEAD each, remembered). Returns their
+        futures (result: the bytes or None, head's True / False; errors are left for the caller's own _download /
+        _exists to meet)."""
         futs = []
         with self._lock:
             for k in keys:
-                f = self._probing.get(k)
+                pk = ("head",) + tuple(k) if head else k
+                f = self._probing.get(pk)
                 if f is None:
-                    f = self._probing[k] = self.probe_pool.submit(self._probe, k)
+                    f = self._probing[pk] = self.probe_pool.submit(self._probe, pk)
                 futs.append(f)
         return futs
 
-    def _probe(self, k):
+    def _probe(self, pk):
         try:
-            return self._download(MAPTERHORN, *k)
+            return self._exists(*pk[1:]) if pk[0] == "head" else self._download(MAPTERHORN, *pk)
         except netfetch.FetchError:
             return None
         finally:
             with self._lock:
-                self._probing.pop(k, None)
+                self._probing.pop(pk, None)
 
     @staticmethod
     def _wait(futs):
@@ -1142,12 +1198,13 @@ class Dem:
 
     # --- the ground under the surface model ------------------------------
     def _lidar(self, x, y):
-        """Has Mapterhorn deeper tiles (national lidar: a terrain model already) under z12 tile (x, y)? Two of
-        its z13 children asked, at once (404s are remembered)."""
-        self._wait(self._ahead([(GLOBAL_ZOOM + 1, 2 * x, 2 * y), (GLOBAL_ZOOM + 1, 2 * x + 1, 2 * y + 1)]))
-        for cx, cy in ((2 * x, 2 * y), (2 * x + 1, 2 * y + 1)):
+        """Has Mapterhorn deeper tiles (national lidar: a terrain model already) under z12 tile (x, y)? Whether two of
+        its z13 children exist, asked at once (_exists: without their bytes; both answers remembered)."""
+        kids = [(GLOBAL_ZOOM + 1, 2 * x, 2 * y), (GLOBAL_ZOOM + 1, 2 * x + 1, 2 * y + 1)]
+        self._wait(self._ahead(kids, head=True))
+        for k in kids:
             try:
-                if self._download(MAPTERHORN, GLOBAL_ZOOM + 1, cx, cy) is not None:
+                if self._exists(*k):
                     return True
             except netfetch.FetchError:
                 self._partial()

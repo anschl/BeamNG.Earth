@@ -81,6 +81,13 @@ class TerrariumFetcher:
 
     def __init__(self, mapterhorn_fails=False):
         self.calls, self.mapterhorn_fails = [], mapterhorn_fails
+        self.heads = []
+
+    def head(self, url, *, kind="demand"):
+        import netfetch
+        self.heads.append(url)
+        if "mapterhorn" in url and self.mapterhorn_fails:
+            raise netfetch.HostUnavailable("down")
 
     def get(self, url, *, kind="demand", headers=None):
         import io
@@ -161,6 +168,59 @@ class LidarDepthFetcher(TerrariumFetcher):
         class R:
             body = buf.getvalue()
         return R()
+
+
+    def head(self, url, *, kind="demand"):
+        import netfetch
+        self.heads.append(url)
+        if "mapterhorn" in url and int(url.rsplit("/", 3)[1]) > 14:
+            raise netfetch.NotFound("no lidar this deep")
+
+
+class LidarHeadTest(unittest.TestCase):
+    """The lidar test asks whether a z12 tile's z13 children exist without downloading them (a HEAD each, 13-26 MB of
+    z13 tiles only for it on a cold cache, 2026-11-12); the answers are remembered on disk, for every process."""
+
+    class Fetcher(TerrariumFetcher):
+        def __init__(self, lidar):
+            super().__init__()
+            self.lidar = lidar          # the z13 (x, y) Mapterhorn has
+
+        def get(self, url, *, kind="demand", headers=None):
+            raise AssertionError(f"downloaded {url}")
+
+        def head(self, url, *, kind="demand"):
+            import netfetch
+            self.heads.append(url)
+            z, x, y = (int(v) for v in url[:-5].rsplit("/", 3)[1:])
+            if (x, y) not in self.lidar:
+                raise netfetch.NotFound("no lidar")
+
+        def miss_alive(self, path, url):
+            import missindex
+            return missindex.known(path)
+
+    def test_heads_remembered(self):
+        import missindex
+        saved = dict(demmod._coverage)
+        demmod._coverage.update(index=None, at=time.time(), failed=True)     # (no file list: every tile asked)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                f = self.Fetcher({(2 * 700 + 1, 2 * 300 + 1)})
+                dem = demmod.Dem(d, fetcher=f)
+                self.assertTrue(dem._lidar(700, 300), "its second child exists")
+                self.assertFalse(dem._lidar(701, 300))
+                self.assertEqual(len(f.heads), 4, "two children each, nothing downloaded")
+                miss = os.path.join(d, "mapterhorn", "13", "1400", f"600{missindex.SUFFIX}")
+                self.assertTrue(missindex.known(miss), "a 404 as _download remembers it")
+                other = demmod.Dem(d, fetcher=f)        # (another process, or after a restart)
+                self.assertEqual((other._lidar(700, 300), other._lidar(701, 300)), (True, False))
+                self.assertEqual(len(f.heads), 4, "asked once")
+                self.assertTrue(other._exists(13, 1401, 601))
+                self.assertFalse(os.path.exists(other._path(demmod.MAPTERHORN, 13, 1401, 601)), "not downloaded")
+        finally:
+            demmod._coverage.clear()
+            demmod._coverage.update(saved)
 
 
 class LidarDepthTest(unittest.TestCase):
