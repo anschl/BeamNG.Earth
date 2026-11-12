@@ -48,6 +48,7 @@ import netfetch
 import polardem
 import revisit
 import staging
+import xproc
 
 log = logging.getLogger("earthd.dem")
 
@@ -199,8 +200,10 @@ HAS_NAME = "_has"
 MT_CDN_K = 3
 MT_CDN_MAX_ZOOM = GLOBAL_ZOOM
 MT_CDN_RETRY_S = 600.0              # the index not to be had: the endpoint alone, asked again after this
-PACK_WAIT_S = 8.0                   # another process fetching a pack: its tile waited for at most this long
-PACK_CLAIM_STALE_S = 30.0           # a pack claim older than this: its process ended mid-fetch
+# One process fetches a pack (or the index), the others wait for it on disk while its process runs (_fetch_once). A
+# fixed 8 s wait was shorter than a 9.4 MB pack's fetch: the waiters fetched it too, Lyon's 8/16/11 four times by four
+# processes (2026-11-12). After this long a waiter fetches it itself (a holder stuck in its retries).
+FETCH_WAIT_S = 60.0
 _cdn_env = os.environ.get("BNGE_DEM_CDN", "").strip()
 MT_CDN_RELEASE = None if _cdn_env.lower() in ("", "off", "0", "none") else _cdn_env
 
@@ -208,6 +211,49 @@ MT_CDN_RELEASE = None if _cdn_env.lower() in ("", "off", "0", "none") else _cdn_
 def mt_cdn_base(release):
     import imagery as imagerymod
     return f"{imagerymod.CDN_BASE}/dem/mapterhorn/{release}"
+
+
+def _fetch_once(claim, ready, wait_s=FETCH_WAIT_S):
+    """One download among the server's processes (and Dem objects), after the caller's own look found nothing:
+    (answer, False) when ready() gives it, once the holder of claim (xproc's lock file) delivered it; (None, True): the
+    caller fetches, then xproc.release(claim); (None, False): it fetches unclaimed (the holder ran past wait_s).
+    ready(): the answer on disk, None while there is none. Unlike xproc.once a holder is waited for whatever its
+    urgency: every DEM download is "demand" (prefetches are refused at once, never slow), and the niced worker processes
+    fetch the same tiles as the main one."""
+    end = time.monotonic() + wait_s
+    recheck = 0.0
+    while True:
+        if xproc.take(claim):
+            got = ready()               # (delivered between the caller's look and the take)
+            if got is not None:
+                xproc.release(claim)
+                return got, False
+            return None, True
+        now = time.monotonic()
+        if now >= recheck:              # (the holder's process looked at now and then: one that ended mid-fetch)
+            h = xproc._holder(claim)
+            if h is not None and not xproc.alive(h[2]):
+                xproc.release(claim)
+                continue
+            recheck = now + xproc.ALIVE_RECHECK_S
+        if now >= end:
+            return None, False
+        time.sleep(CLAIM_POLL_S * 2)
+        got = ready()
+        if got is not None:
+            return got, False
+
+
+def _index_on_disk(path):
+    """The packs' index.bin at path when it is there and whole (tilepack.index_check), else None."""
+    import tilepack
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        tilepack.index_check(data)
+        return data
+    except (OSError, tilepack.PackError):
+        return None
 
 
 class DemUnavailable(IOError):
@@ -324,6 +370,7 @@ class Dem:
         self._nowrite_logged = False
         self.cdn_release = MT_CDN_RELEASE   # the packs' release (MT_CDN_*), None: the endpoint alone
         self._cdn_idx = None            # (release, index bytes) once read
+        self._cdn_lock = threading.Lock()
         self._cdn_failed_at = -1e18
         self._pack_locks = {}           # pack key -> lock: one fetch of a pack at a time in this process
 
@@ -539,7 +586,6 @@ class Dem:
             path = os.path.join(self.cache_dir, MAPTERHORN["name"], "download_urls.json")
             got = _coverage_on_disk(path)
             if got is None:
-                import xproc
                 lock = path + ".lock"
                 got, mine = xproc.once(lock, lambda: _coverage_on_disk(path), COVERAGE_WAIT_S)
                 try:
@@ -767,35 +813,49 @@ class Dem:
         got = self._cdn_idx
         if got is not None and got[0] == rel:
             return got[1]
-        if time.monotonic() - self._cdn_failed_at < MT_CDN_RETRY_S:
-            return None
-        import tilepack
-        path = os.path.join(self.cache_dir, "bngmt", rel, "index.bin")
-        data = None
-        try:
-            with open(path, "rb") as f:
-                data = f.read()
-            tilepack.index_check(data)
-        except (OSError, tilepack.PackError):
-            data = None
-        if data is None:
-            try:
-                data = self.fetcher.get(mt_cdn_base(rel) + "/index.bin", kind="demand").body
-                tilepack.index_check(data)
-            except (netfetch.FetchError, tilepack.PackError) as e:
-                log.info("dem: the tile host's Mapterhorn packs (%s): no index (%s: %s): the endpoint meanwhile",
-                         rel, type(e).__name__, e)
-                self._cdn_failed_at = time.monotonic()
+        # (one read per process, one download per server: the threads asking at a process's start downloaded it each,
+        # 10-16 times within 0.15 s, 2026-11-12)
+        with self._cdn_lock:
+            got = self._cdn_idx
+            if got is not None and got[0] == rel:
+                return got[1]
+            if time.monotonic() - self._cdn_failed_at < MT_CDN_RETRY_S:
                 return None
-            try:
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
-                with open(tmp, "wb") as f:
-                    f.write(data)
-                os.replace(tmp, path)
-            except OSError:
-                pass
-        self._cdn_idx = (rel, data)
+            path = os.path.join(self.cache_dir, "bngmt", rel, "index.bin")
+            data = _index_on_disk(path)
+            if data is None:
+                claim = os.path.join(self.cache_dir, "bngmt", rel, "claims", "index")
+                data, mine = _fetch_once(claim, lambda: _index_on_disk(path))
+                try:
+                    if data is None:
+                        data = self._cdn_index_fetch(rel, path)
+                finally:
+                    if mine:
+                        xproc.release(claim)
+                if data is None:
+                    return None
+            self._cdn_idx = (rel, data)
+            return data
+
+    def _cdn_index_fetch(self, rel, path):
+        """The release's index.bin from the tile host, written to path; None when it cannot be had."""
+        import tilepack
+        try:
+            data = self.fetcher.get(mt_cdn_base(rel) + "/index.bin", kind="demand").body
+            tilepack.index_check(data)
+        except (netfetch.FetchError, tilepack.PackError) as e:
+            log.info("dem: the tile host's Mapterhorn packs (%s): no index (%s: %s): the endpoint meanwhile",
+                     rel, type(e).__name__, e)
+            self._cdn_failed_at = time.monotonic()
+            return None
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, path)
+        except OSError:
+            pass
         return data
 
     def _download_pack(self, z, x, y, kind):
@@ -820,64 +880,42 @@ class Dem:
         with self._lock:
             lock = self._pack_locks.setdefault((pz, px, py), threading.Lock())
         with lock:
-            path = self._path(MAPTERHORN, z, x, y)
-            data = self.disk.read(path)             # (another tile of the pack fetched it meanwhile)
-            if data is not None:
+            # (the pack fetched meanwhile by another thread: the tile, or its 404 when the pack lacks it. Only the tile
+            # was looked for, so the threads asking for a pack's sea tiles at once fetched it again one after the
+            # other: Hartford's 6/2/3 three times by one process within 6 s, 2026-11-12)
+            got = self._pack_ready(z, x, y)
+            if got is not None:
                 self._count(name + ":disk")
-                return data
-            with self._lock:
-                data = self._mem_raw.get((name, z, x, y))
-                if data is None and (name, z, x, y) in self._mem_miss:
-                    return None
-            if data is not None:
-                return data
+                return got[0]
             # (one process fetches a pack, the others wait for its tiles on disk: a cold place's 25 packs were asked
             # 48 times by the server's processes at once, 2026-11-12)
             claim = os.path.join(self.cache_dir, "bngmt", self.cdn_release, "claims", f"{pz}_{px}_{py}")
-            if not self._pack_claim(claim):
-                got = self._pack_wait(path, miss(z, x, y)[1])
-                if got is not False:
-                    self._count("bngmt:waited")
-                    return got
+            got, mine = _fetch_once(claim, lambda: self._pack_ready(z, x, y))
+            if got is not None:
+                self._count("bngmt:waited")
+                return got[0]
             try:
                 return self._fetch_pack(pz, px, py, k, x, y, kind, miss)
             finally:
-                try:
-                    os.remove(claim)
-                except OSError:
-                    pass
+                if mine:
+                    xproc.release(claim)
 
-    def _pack_claim(self, claim):
-        """True: this process fetches the pack (its claim file made, or claims cannot be made here); False: another
-        process has fetched it within PACK_CLAIM_STALE_S."""
-        for _ in range(2):
-            try:
-                os.makedirs(os.path.dirname(claim), exist_ok=True)
-                os.close(os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
-                return True
-            except FileExistsError:
-                try:
-                    if time.time() - os.path.getmtime(claim) < PACK_CLAIM_STALE_S:
-                        return False
-                    os.remove(claim)        # (a process that ended mid-pack)
-                except OSError:
-                    pass
-            except OSError:
-                return True
-        return True
-
-    def _pack_wait(self, path, marker):
-        """The tile another process's pack fetch writes at path: its bytes, None (the pack lacks it: its 404
-        recorded), or False when it did not come within PACK_WAIT_S (fetched here then)."""
-        end = time.monotonic() + PACK_WAIT_S
-        while time.monotonic() < end:
-            time.sleep(CLAIM_POLL_S * 2)
-            data = self.disk.read(path)
-            if data is not None:
-                return data
-            if missindex.known(marker):
-                return None
-        return False
+    def _pack_ready(self, z, x, y):
+        """(bytes,) of Mapterhorn tile (z, x, y) once its pack was fetched (on disk or kept in memory), (None,) for a
+        tile the pack lacks (its 404 remembered); None before."""
+        name = MAPTERHORN["name"]
+        data = self.disk.read(self._path(MAPTERHORN, z, x, y))
+        if data is not None:
+            return (data,)
+        mk = (name, z, x, y)
+        with self._lock:
+            data = self._mem_raw.get(mk)
+            if data is not None or mk in self._mem_miss:
+                return (data,)
+        miss = os.path.join(self.cache_dir, name, str(z), str(x), f"{y}.404")
+        if self.fetcher.miss_alive(miss, MAPTERHORN["url"].format(z=z, x=x, y=y)):
+            return (None,)
+        return None
 
     def _fetch_pack(self, pz, px, py, k, x, y, kind, miss):
         import tilepack

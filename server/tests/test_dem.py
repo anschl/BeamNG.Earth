@@ -637,7 +637,7 @@ class CdnPackTest(unittest.TestCase):
             dem._cdn_index()
             n = len(f.calls)
             claim = os.path.join(d, "bngmt", "0.0.13", "claims", "12_87_187")
-            os.makedirs(os.path.dirname(claim))
+            os.makedirs(os.path.dirname(claim), exist_ok=True)
             open(claim, "w").close()
             path = dem._path(demmod.MAPTERHORN, 12, 700, 1500)
 
@@ -652,10 +652,85 @@ class CdnPackTest(unittest.TestCase):
             t.join()
             self.assertEqual(len(f.calls), n, "nothing asked")
             self.assertEqual(dem.stats["bngmt:waited"], 1)
-            os.utime(claim, (time.time() - 60, time.time() - 60))      # a stale claim: fetched here
+            import xproc
+            old = time.time() - xproc.STALE_S - 5
+            os.utime(claim, (old, old))                                 # a stale claim: fetched here
             self.assertIsNotNone(dem._download(demmod.MAPTERHORN, 12, 701, 1500))
             self.assertEqual(len(f.calls), n + 1)
             self.assertFalse(os.path.exists(claim), "its claim removed after the fetch")
+
+    def test_a_slow_holder_is_waited_for(self):
+        """A pack another process is fetching is waited for while that process runs; one that ended is taken over at
+        once (not after a timeout)."""
+        import subprocess
+        import xproc
+        with tempfile.TemporaryDirectory() as d:
+            f = PackFetcher(packs={(12, 87, 187)})
+            dem = demmod.Dem(d, fetcher=f)
+            dem.cdn_release = "0.0.13"
+            dem._cdn_index()
+            n = len(f.calls)
+            claim = os.path.join(d, "bngmt", "0.0.13", "claims", "12_87_187")
+            other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+            try:
+                os.makedirs(os.path.dirname(claim), exist_ok=True)
+                with open(claim, "w") as fh:
+                    fh.write(f"1 0 {other.pid}")                        # (xproc.take's line, the other process's)
+                path = dem._path(demmod.MAPTERHORN, 12, 700, 1500)
+
+                def deliver():
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, "wb") as fh:
+                        fh.write(b"theirs")
+                    xproc.release(claim)
+                threading.Timer(0.5, deliver).start()
+                self.assertEqual(dem._download(demmod.MAPTERHORN, 12, 700, 1500), b"theirs")
+                self.assertEqual(len(f.calls), n, "nothing asked")
+                with open(claim, "w") as fh:
+                    fh.write(f"1 0 {other.pid}")
+                other.kill()
+                other.wait()
+                t0 = time.monotonic()                                   # its process ended mid-fetch: fetched here
+                self.assertIsNotNone(dem._download(demmod.MAPTERHORN, 12, 701, 1500))
+                self.assertLess(time.monotonic() - t0, 3.0)
+                self.assertEqual(len(f.calls), n + 1)
+            finally:
+                other.kill()
+                other.wait()
+
+    def test_one_fetch_per_pack_and_index(self):
+        """Threads (and a second Dem of the same process) asking for one pack's tiles at once, sea tiles among them:
+        the index and the pack downloaded once; the sea tiles' 404s and the others' bytes as from one fetch."""
+        with tempfile.TemporaryDirectory() as d:
+            holes = {(12, 701, 1501), (12, 702, 1502)}
+            f = PackFetcher(packs={(12, 87, 187)}, holes=holes)
+            real_get = f.get
+
+            def slow_get(url, **kw):
+                time.sleep(0.2)                     # (every asker reaches the fetch while the first is downloading)
+                return real_get(url, **kw)
+            f.get = slow_get
+            dems = [demmod.Dem(d, fetcher=f), demmod.Dem(d, fetcher=f)]
+            keys = [(12, 700 + i % 4, 1500 + i // 4) for i in range(16)]
+            got = {}
+
+            def ask(i):
+                dem = dems[i % 2]
+                dem.cdn_release = "0.0.13"
+                got[keys[i]] = dem._download(demmod.MAPTERHORN, *keys[i])
+            ts = [threading.Thread(target=ask, args=(i,)) for i in range(len(keys))]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+            self.assertEqual(sorted(f.calls), sorted([demmod.mt_cdn_base("0.0.13") + "/index.bin",
+                                                      demmod.mt_cdn_base("0.0.13") + "/12/87/187.bngp"]))
+            for k in keys:
+                if k in holes:
+                    self.assertIsNone(got[k], k)
+                else:
+                    ref = TerrariumFetcher().get(f"https://tiles.mapterhorn.com/{k[0]}/{k[1]}/{k[2]}.webp").body
+                    self.assertEqual(got[k], ref, k)
 
 
 if __name__ == "__main__":
