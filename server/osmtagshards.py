@@ -13,7 +13,8 @@ Thin glue: the bytes through netfetch, kept on disk per build; the tile's blob d
 osmtagshards.rs otg_decode, by the manifest's schema) into osmtags' row-group table, so the cell's tags, raceways and
 busways, outlines and motorway geometry are picked by osmtags' own code (osmtags.from_tile / geometry_from_tile:
 cell_rows, tags_and_ways, _lane_rows): the very values the parquet path gives for the same Layercake version (the
-manifest's source_etag; 125 cells of 5 places compared equal, tags in the same order and types).
+manifest's source_etag; 125 cells of 5 places compared equal, tags in the same order and types). A build may carry
+more columns than osmtags' (schema_ok asks only for those): the route shields' ways, read by routerepeaters.tile_routes.
 
   <cache>/pagesdata/osmtags/manifest.json            the build in use (railtags.Shards: pinned first, refreshed daily)
   <cache>/pagesdata/osmtags/<build>/head.bin         the archive's first 16 KB (header + root directory), head.json

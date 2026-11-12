@@ -96,6 +96,25 @@ class RouteRepeatersTest(unittest.TestCase):
         source.tags._forget.assert_called_once()
         self.assertEqual(list(source.cache),[('new',-852,349)])
 
+    def test_layercake_file_when_the_tag_shards_cannot_answer(self):
+        old={'numeric':[['lanes',4]],'text':['name'],'lines':[]}
+        new={'numeric':[[c,4] for c in repeat.ROUTE_BOX],'text':list(repeat.ROUTE_TEXT),'lines':[]}
+        self.assertFalse(repeat.routes_ok(old))
+        self.assertFalse(repeat.routes_ok(None))
+        self.assertTrue(repeat.routes_ok(new))
+        for schema,fails,shard_reads,downs in ((old,False,0,0),(new,True,1,1),(new,False,1,0)):
+            shards=mock.Mock()
+            shards.manifest.return_value=('b1',dict(zoom=12,schema=schema))
+            source=repeat.Source('unused',None,lambda: shards)
+            source.tags.version=lambda: ('etag',None)
+            with mock.patch.object(repeat,'shard_routes',side_effect=OSError('down') if fails else None,
+                                   return_value=corridor()) as sharded, \
+                    mock.patch.object(repeat,'read_routes',return_value=corridor()) as read:
+                got=source._cell(-851,349)
+            self.assertTrue(got)
+            self.assertEqual((sharded.call_count,shards.down.call_count,read.call_count),
+                             (shard_reads,downs,1-shard_reads+downs))
+
     def test_shield_mesh_places_clear_of_widened_pavement(self):
         with tempfile.TemporaryDirectory() as tmp:
             md=fixture(tmp)

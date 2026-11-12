@@ -29,7 +29,8 @@ class Source:
         self.tags = tags if tags is not None else railtags.SignTags(md.cache_dir, md.fetcher)
         self.md = md
         self.shields = legacyshields.Source(getattr(md, 'cache_dir', None))
-        self.repeaters = routerepeaters.Source(md.raw_dir, md.fetcher) if hasattr(md, 'raw_dir') else None
+        self.repeaters = routerepeaters.Source(md.raw_dir, md.fetcher, getattr(md, '_osm_shards', None)) \
+            if hasattr(md, 'raw_dir') else None
         self.contexts = {}
         self.lock = threading.Lock()
         self.warned = -float('inf')
