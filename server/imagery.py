@@ -1672,13 +1672,18 @@ class Imagery:
             ck = (s.name, z, x0, y0, k)
             full = self._full_blocks.get(ck)
             keys = [(s, z, tx % n, ty) for ty in range(y0 - 1, y0 + side + 1) for tx in range(x0 - 1, x0 + side + 1)]
-            if full and not all(self._on_disk(kk) for kk in keys):
+            # (render needs each tile's coverage probe too, tiles(): one evicted is asked again, and with the host down
+            # the source is not drawn there)
+            probes = {p for p in map(self._probe_key, keys) if p is not None}
+            if full and not all(self._on_disk(kk) for kk in (*keys, *probes)):
                 self._full_blocks.pop(ck, None)     # (evicted or discarded since: the lazy source may be needed again)
                 full = None
             if full is None:
-                if not all(0 <= kk[3] < n and not outside(kk) and self._on_disk(kk) for kk in keys):
+                if not all(0 <= kk[3] < n and not outside(kk) and self._on_disk(kk) for kk in keys) or \
+                        not all(self._on_disk(p) for p in probes):
                     continue                # (not all fetched yet: no verdict)
-                full = all(_draws_whole(self._disk_tile(kk)) for kk in keys)
+                full = all(_draws_whole(self._disk_tile(kk)) for kk in keys) and \
+                    all(self._covered(self._disk_tile(p)) for p in probes)
                 if len(self._full_blocks) > 100000:
                     self._full_blocks.clear()
                 self._full_blocks[ck] = full

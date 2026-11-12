@@ -809,8 +809,8 @@ class ExportImageryTest(unittest.TestCase):
         self.assertEqual(used, used_ref)
 
     def test_a_full_block_whose_tiles_left_the_disk_is_not_full(self):
-        """The 'filled' verdict holds only while the cache's tiles are on disk: one evicted, the lazy source is
-        warmed again there."""
+        """The 'filled' verdict holds only while the cache's tiles and their coverage probes are on disk: one evicted,
+        the lazy source is warmed again there."""
         chain = ("virginia", "naipusda", "usgs")
         vs, naip = imagery.SOURCES["virginia"], imagery.SOURCES["naipusda"]
         im = self.make(chain=chain, serve_xyz=lambda name, z, x, y: (200, png(background(z, x, y))))
@@ -822,8 +822,14 @@ class ExportImageryTest(unittest.TestCase):
         ring = {(vs, 17, tx, ty) for tx in range(x0 - 1, x0 + (1 << k) + 1) for ty in range(y0 - 1, y0 + (1 << k) + 1)}
         im.tiles(ring)
         self.assertTrue(im._filled_before(naip, 17, x, y))
+        probe = im._probe_key((vs, 17, x0, y0))
+        self.assertIsNotNone(probe, "the cache's tiles have a coverage probe render needs too")
+        os.rename(im._paths(*probe)[0], im._paths(*probe)[0] + ".away")
+        self.assertFalse(im._filled_before(naip, 17, x, y), "its probe evicted")
+        os.rename(im._paths(*probe)[0] + ".away", im._paths(*probe)[0])
+        self.assertTrue(im._filled_before(naip, 17, x, y))
         os.remove(im._paths(vs, 17, x0, y0)[0])
-        self.assertFalse(im._filled_before(naip, 17, x, y))
+        self.assertFalse(im._filled_before(naip, 17, x, y), "a tile evicted")
 
     def test_us_sources_never_asked_outside_the_us(self):
         """Amsterdam: no USGS coverage probe, no NAIP export (a cold visit sent basemap.nationalmap.gov 50 requests, all
