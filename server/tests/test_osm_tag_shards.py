@@ -90,13 +90,24 @@ def fixture_rows(seed=7):
     rows.append((900005, dict(highway="busway", name="Bus", lanes="2", oneway="yes"),
                  np.array([[LON0 - 0.02, LAT0], [LON0 + 0.02, LAT0 + 0.001]])))
     rows.append((900006, dict(highway="primary", name="No box"), None))     # (a NULL bbox: in no cell)
+    # route shields' ways (routerepeaters.read_routes): with a tag the roads use, without one (a row osmtags leaves
+    # out), with a bridge / access, and two it does not take (a link, a state route)
+    long = np.array([[LON0 - 0.05, LAT0 - 0.04], [LON0 - 0.01, LAT0 - 0.01], [LON0 + 0.045, LAT0 + 0.05]])
+    rows.append((900010, dict(highway="motorway", ref="I 17", oneway="yes", lanes="2"), long))
+    rows.append((900011, dict(highway="primary", ref="US 180"), long[::-1] + [0.003, 0.0]))
+    rows.append((900012, dict(highway="trunk", ref="US 89;AZ 64", bridge="yes", access="no"),
+                 np.array([[LON0 + 0.02, LAT0 - 0.05], [LON0 + 0.021, LAT0 + 0.05]])))
+    rows.append((900013, dict(highway="secondary", ref="I-40", name="Route 66"),
+                 np.array([[LON0 - 0.06, LAT0 + 0.02], [LON0 + 0.06, LAT0 + 0.021]])))
+    rows.append((900014, dict(highway="motorway_link", ref="I 17"), long[:2]))
+    rows.append((900015, dict(highway="primary", ref="AZ 64"), long[1:]))
     return rows
 
 
 def write_parquet(path, rows, group_rows=64):
     con = duckdb.connect()
     cols = ["highway", "name", "lanes", "width", "maxspeed", "sidewalk", "lit", "smoothness", "surface", "oneway",
-            "layer", "bridge", "tunnel", "ref"]
+            "layer", "bridge", "tunnel", "ref", "access"]
     con.execute("CREATE TABLE h (id BIGINT, " + ", ".join(f'"{c}" VARCHAR' for c in cols)
                 + ", bbox STRUCT(xmin FLOAT, ymin FLOAT, xmax FLOAT, ymax FLOAT), geometry BLOB)")
     for wid, tags, line in rows:
@@ -151,7 +162,8 @@ def layercake_store(tmp, path):
     for rg, first, n, (x0, y0, x1, y1) in bt.row_groups(path):
         groups[rg] = {"first": first, "n": n, "bbox": {"xmin": (x0, x0), "ymin": (y0, y0), "xmax": (x1, x1),
                                                      "ymax": (y1, y1)},
-                      "cols": {c: [] for c in ("id", "bbox", "geometry", "highway", "name", "lanes")}}
+                      "cols": {c: [] for c in ("id", "bbox", "geometry", "highway", "name", "lanes", "ref", "oneway",
+                                               "bridge", "tunnel", "access")}}
     remote = SimpleNamespace(cache_dir=os.path.join(tmp, "lc"))
     store._groups = lambda *a: groups
     store.version = lambda *a: ("e", remote)
@@ -298,6 +310,36 @@ class ShardsMatchLayercakeTest(unittest.TestCase):
         if self.PARTS:
             self.assertGreater(len({s[0] for s in reads}), 1, "tiles read from more than one part")
 
+    def test_route_ways_as_read_routes_gives_them(self):
+        """The route shields' ways (and so the shields) from the tiles are the Layercake file's, none read there."""
+        import routerepeaters as rr
+        store, remote = layercake_store(os.path.join(self.tmp, "lc8"), self.parquet)
+        sh = self.shards(os.path.join(self.tmp, "c8"), FakeFetcher(self.files()))
+        m = sh.manifest()[1]
+        self.assertTrue(rr.routes_ok(m["schema"]))
+        seen = set()
+        for area in ((LON0 - 0.1, LAT0 - 0.1, LON0 + 0.1, LAT0 + 0.1), (LON0 - 0.004, LAT0 - 0.004, LON0, LAT0),
+                     (LON0 + 0.03, LAT0 - 0.01, LON0 + 0.05, LAT0 + 0.01), (LON0 + 0.2, LAT0, LON0 + 0.3, LAT0 + 0.1)):
+            want = sorted(rr.read_routes(store, remote, area), key=lambda w: w[0])
+            got = sorted(rr.shard_routes(sh, m, area), key=lambda w: w[0])
+            self.assertEqual([(w[0], w[2]) for w in got], [(w[0], w[2]) for w in want], area)
+            for a, b in zip(got, want):
+                np.testing.assert_array_equal(a[1], b[1])
+            seen |= {w[0] for w in want}
+        self.assertEqual(seen, {900010, 900011, 900012, 900013})
+
+        def source(shards):
+            s = rr.Source(os.path.join(self.tmp, "lc8"), None, shards)
+            s.tags = store
+            return s
+        cells = [(x, y) for x in range(math.floor((LON0 - 0.06) / rr.CELL_DEG), math.floor((LON0 + 0.06) / rr.CELL_DEG) + 1)
+                 for y in range(math.floor((LAT0 - 0.06) / rr.CELL_DEG), math.floor((LAT0 + 0.06) / rr.CELL_DEG) + 1)]
+        want = [source(None)._cell(x, y) for x, y in cells]
+        with mock.patch.object(rr, "read_routes", side_effect=AssertionError("the Layercake file was read")):
+            got = [source(lambda: sh)._cell(x, y) for x, y in cells]
+        self.assertEqual(json.dumps(got, sort_keys=True), json.dumps(want, sort_keys=True))
+        self.assertGreater(sum(map(len, want)), 3)
+
     def test_tile_ranges_are_osmtags_cell_test(self):
         rng = np.random.default_rng(3)
         z = 9
@@ -376,7 +418,7 @@ class ShardsMatchLayercakeTest(unittest.TestCase):
     def test_a_manifest_this_does_not_read_is_not_used(self):
         files = self.files()
         m = json.loads(files[f"{BASE}/manifest.json"])
-        m["schema"]["text"] = m["schema"]["text"][:-1]
+        m["schema"]["text"].remove("lane_hw")      # (an osmtags column; one past them is ignored)
         files[f"{BASE}/manifest.json"] = json.dumps(m).encode()
         sh = self.shards(os.path.join(self.tmp, "c5"), FakeFetcher(files))
         with self.assertRaises(osmtagshards.NotInUse):
@@ -424,6 +466,10 @@ class BuilderTest(unittest.TestCase):
         self.assertEqual(bt.USED, osmtags.USED)
         self.assertEqual(bt.UNBUILT, osmtags.UNBUILT)
         self.assertEqual(bt.RACEWAY_COLUMNS, osmtags.RACEWAY_COLUMNS)
+        import routerepeaters
+        self.assertEqual(bt.ROUTE_WHERE, routerepeaters.ROUTE_WHERE)
+        self.assertEqual(bt.ROUTE_TEXT, routerepeaters.ROUTE_TEXT)
+        self.assertEqual(bt.ROUTE_BOX, routerepeaters.ROUTE_BOX)
         self.assertEqual(bt.linestring(_wkb([[1.5, 2.5], [3.0, 4.0]])).tolist(), [[1.5, 2.5], [3.0, 4.0]])
         self.assertIsNone(bt.linestring(struct.pack("<BI", 1, 3) + b"x" * 20))
 

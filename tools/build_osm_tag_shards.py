@@ -35,6 +35,13 @@ same SQL (DuckDB), plus:
   before (osmtags.is_outline).
 - "inside": per such raceway, the file rows of the raceways inside its bbox (osmtags._inside_rows, file-wide).
 - "geom": the geometry of the rows with a lane count and a motorway / trunk class (osmtags.highway_geometry).
+- the route shields' ways (server/routerepeaters.py's read_routes: an I / US ref on a motorway ... tertiary, ROUTE_WHERE)
+  with their line in "geom" and their raw highway, ref, bridge, tunnel, access, junction, direction in the text columns
+  route_* (NULL on every other row; oneway is osm_oneway). One without a tag the roads use is a row with its bbox in
+  route_bx0... and NaN in bx0... (in no cell's rows: osmtags reads what it read before). Why (2026-11-12): without
+  them the shields read the Layercake file itself, 24-46 MB a new US place (Hartford CT, San Francisco, Lone Pine CA).
+  The schema names them, so a server that reads route_* finds them and an older one decodes and ignores them (it
+  takes any column past osmtags' own).
 Blob (OTG1, little endian, uv = LEB128 varint, zz = zig-zag): "OTG1", uv n; frn n x uv delta; id n x uv zz(delta);
 flags n x u8 (1 raceway, 2 busway); bbox: bx0, by0, bx1, by1 each n x uv zz(delta of the float32's ordered bits); per
 numeric column uv nnz, nnz x uv row delta, nnz raw float32 / float64; per text column uv ndict, ndict x (uv length,
@@ -97,11 +104,18 @@ EXACT32 = {"bx0", "by0", "bx1", "by1", "lanes", "osm_layer"}
 USED = {"id", "bbox", "lanes", "width", "maxspeed", "sidewalk", "lit", "smoothness", "surface", "oneway", "layer", "name"}
 UNBUILT = ("construction", "proposed")
 RACEWAY_COLUMNS = ("id", "highway", "name", "surface", "width", "lanes", "layer", "bridge", "tunnel", "oneway")
+# --- routerepeaters.read_routes' ways (the tests keep these equal to server/routerepeaters.py's) ---------------------
+ROUTE_WHERE = ("highway IN ('motorway','trunk','primary','secondary','tertiary') "
+               "AND regexp_matches(ref, '(?i)(^|;)\\s*(I|US)[ -]?[0-9]{1,3}\\s*(;|$)')")
+ROUTE_TEXT = ("route_highway", "route_ref", "route_bridge", "route_tunnel", "route_access", "route_junction",
+              "route_direction")
+ROUTE_BOX = ("route_bx0", "route_by0", "route_bx1", "route_by1")
 # ---------------------------------------------------------------------------------------------------------------------
 
 BOX = ("bx0", "by0", "bx1", "by1")
-NUMERIC = [c for c in COLUMNS if c not in TEXT_COLUMNS and c not in BOX]          # lanes, width, maxspeed, osm_layer
-TEXTS = [c for c in COLUMNS if c in TEXT_COLUMNS]
+NUMERIC = [c for c in COLUMNS if c not in TEXT_COLUMNS and c not in BOX] + list(ROUTE_BOX)  # lanes ... osm_layer, route_*
+TEXTS = [c for c in COLUMNS if c in TEXT_COLUMNS] + list(ROUTE_TEXT)
+FLOAT32 = EXACT32 | set(ROUTE_BOX)
 LINE_COLS = RACEWAY_COLUMNS[1:]
 
 
@@ -266,7 +280,7 @@ def text_column(v):
 
 def schema():
     """The blob's columns, in their order (the manifest's "schema": the server's decoder takes them from it)."""
-    return {"numeric": [[c, 4 if c in EXACT32 else 8] for c in NUMERIC], "text": list(TEXTS),
+    return {"numeric": [[c, 4 if c in FLOAT32 else 8] for c in NUMERIC], "text": list(TEXTS),
             "lines": list(LINE_COLS)}
 
 
@@ -283,9 +297,9 @@ def encode_tile(rows, lines, inside, geom):
     for c in BOX:
         out.append(uv(zz(deltas(ordered32(rows[c])))))
     for c in NUMERIC:
-        v = np.asarray(rows[c], np.float32 if c in EXACT32 else np.float64)
+        v = np.asarray(rows[c], np.float32 if c in FLOAT32 else np.float64)
         nz = np.flatnonzero(~np.isnan(v))
-        out += [uv1(len(nz)), uv(deltas(nz)), v[nz].astype("<f4" if c in EXACT32 else "<f8").tobytes()]
+        out += [uv1(len(nz)), uv(deltas(nz)), v[nz].astype("<f4" if c in FLOAT32 else "<f8").tobytes()]
     for c in TEXTS:
         uniq, nz, codes = text_column(rows[c])
         out.append(uv1(len(uniq)))
@@ -453,6 +467,11 @@ def etag_of(src):
         return (r.headers.get("ETag") or "").strip()
 
 
+def columns_of(src):
+    """The file's top-level column names (Layercake's has no junction or direction: read_routes reads NULL for them)."""
+    return {r[0] for r in _connect().execute(f"DESCRIBE SELECT * FROM read_parquet('{src}')").fetchall()}
+
+
 def row_groups(src):
     """[(row group, first row, rows, (xmin, ymin, xmax, ymax) of its bbox statistics)] of the file."""
     con = _connect()
@@ -484,35 +503,46 @@ def row_groups(src):
 
 
 def decode_group(args):
-    """One row group's rows (osmtags._decode's query, plus the raceways' raw columns and the geometry the tiles keep),
-    saved to tmp/<rg>.npz; returns (rg, rows, path)."""
-    src, rg, first, nrows, tmp, z, cz, clip = args
+    """One row group's rows (osmtags._decode's query, plus the raceways' raw columns, the route ways' tags
+    (routerepeaters.read_routes': ROUTE_WHERE; a column the file lacks NULL, as there) and the geometry the tiles keep),
+    saved to tmp/<rg>.npz; returns (rg, rows, path). A route way osmtags leaves out (no tag the roads use) keeps its
+    bbox in route_bx0... only, its own NaN: in no cell's rows, so osmtags' answers stay as they were."""
+    src, rg, first, nrows, tmp, z, cz, clip, have = args
     global _CON
     if _CON is None:
         _CON = _connect()
     cols = ", ".join(f"{expr} AS \"{c}\"" for c, expr in COLUMNS.items())
     some = " OR ".join([f"{c} IS NOT NULL" for c in sorted(USED - {"id", "bbox"})]
                        + [f"highway IN ({', '.join(repr(v) for v in UNBUILT)})"])
+    osm = f"highway = 'raceway' OR highway = 'busway' OR {some}"
     lanes, hw = COLUMNS["lanes"], COLUMNS["lane_hw"]
     raw = ", ".join(f"CASE WHEN highway IN ('raceway', 'busway') THEN \"{c}\" END" for c in LINE_COLS)
-    got = _CON.execute(f"""SELECT id, highway = 'raceway', highway = 'busway', file_row_number, {cols}, {raw},
-        CASE WHEN highway IN ('raceway', 'busway') OR (({lanes}) IS NOT NULL AND ({hw}) IS NOT NULL)
+    route = ", ".join([f"CASE WHEN {ROUTE_WHERE} THEN bbox.{c} END" for c in ("xmin", "ymin", "xmax", "ymax")]
+                      + [f"CASE WHEN {ROUTE_WHERE} THEN \"{c[6:]}\" END" if c[6:] in have else "NULL"
+                         for c in ROUTE_TEXT])
+    got = _CON.execute(f"""SELECT id, highway = 'raceway', highway = 'busway', file_row_number, {cols}, {route}, {raw},
+        COALESCE({osm}, false),
+        CASE WHEN highway IN ('raceway', 'busway') OR (({lanes}) IS NOT NULL AND ({hw}) IS NOT NULL) OR ({ROUTE_WHERE})
              THEN geometry END
         FROM read_parquet('{src}', file_row_number = true)
         WHERE file_row_number BETWEEN {first} AND {first + nrows - 1}
-        AND (highway = 'raceway' OR highway = 'busway' OR {some})
+        AND ({osm} OR ({ROUTE_WHERE}))
         ORDER BY file_row_number""").fetchall()
-    names = list(COLUMNS)
+    names = list(COLUMNS) + list(ROUTE_BOX) + list(ROUTE_TEXT)
     t = {"id": np.array([r[0] for r in got], np.int64), "race": np.array([bool(r[1]) for r in got], bool),
          "bus": np.array([bool(r[2]) for r in got], bool), "frn": np.array([r[3] for r in got], np.int64)}
     for j, c in enumerate(names, 4):
         vals = [r[j] for r in got]
-        if c in TEXT_COLUMNS:
+        if c in TEXT_COLUMNS or c in ROUTE_TEXT:
             t[c] = np.array(["\0" if v is None else str(v) for v in vals], object)
             t[c + "_ok"] = np.array([v is not None for v in vals], bool)
         else:
             t[c] = np.array([np.nan if v is None else float(v) for v in vals],
-                            np.float32 if c in EXACT32 else np.float64)
+                            np.float32 if c in FLOAT32 else np.float64)
+    hidden = t["route_highway_ok"] & ~np.array([bool(r[-2]) for r in got], bool)
+    for c, rc in zip(BOX, ROUTE_BOX):
+        t[c][hidden] = np.nan
+        t[rc][~hidden] = np.nan
     j0 = 4 + len(names)
     lines = {}
     for r in got:
@@ -561,15 +591,16 @@ def _load(path):
 def _prepare(t, z, clip=None):
     """A row group's decoded rows made ready for cutting into tiles: each row's tile ranges (_r; clip (x0, x1, y0,
     y1): only those tiles), which rows reach a tile (_ok), the rows the lines / geometry sections look at (_special),
-    each text column as codes into its distinct values (_codes), and where a row's line and geometry are."""
-    x0, x1, y0, y1 = tile_ranges(t["bx0"], t["by0"], t["bx1"], t["by1"], z)
+    each text column as codes into its distinct values (_codes), and where a row's line and geometry are. A route way
+    without a bbox of its own (decode_group) goes to the tiles its route_bx0... touch."""
+    box = [np.where(np.isnan(t[c]), t[rc], t[c]) for c, rc in zip(BOX, ROUTE_BOX)]
+    x0, x1, y0, y1 = tile_ranges(*box, z)
     if clip is not None:
         x0, x1 = np.maximum(x0, clip[0]), np.minimum(x1, clip[1])
         y0, y1 = np.maximum(y0, clip[2]), np.minimum(y1, clip[3])
     t["_r"] = (x0, x1, y0, y1)
-    t["_ok"] = ~(np.isnan(t["bx0"]) | np.isnan(t["by0"]) | np.isnan(t["bx1"]) | np.isnan(t["by1"])) \
-        & (x1 >= x0) & (y1 >= y0)
-    t["_special"] = t["race"] | t["bus"] | (~np.isnan(t["lanes"]) & t["lane_hw_ok"])
+    t["_ok"] = ~(np.isnan(box[0]) | np.isnan(box[1]) | np.isnan(box[2]) | np.isnan(box[3])) & (x1 >= x0) & (y1 >= y0)
+    t["_special"] = t["race"] | t["bus"] | (~np.isnan(t["lanes"]) & t["lane_hw_ok"]) | t["route_highway_ok"]
     t["_codes"] = {}
     for c in TEXTS:
         uniq, inv = np.unique(t[c].astype(str), return_inverse=True) if len(t[c]) else (np.zeros(0, str),
@@ -636,7 +667,7 @@ def _tile(parts, table, inside_of, race_rg):
                         got = _line(table(race_rg[g]), g)
                         if got is not None:
                             lines[g] = got
-            if not np.isnan(t["lanes"][i]) and t["lane_hw_ok"][i]:
+            if (not np.isnan(t["lanes"][i]) and t["lane_hw_ok"][i]) or t["route_highway_ok"][i]:
                 gk = t["_geo"].get(f)
                 if gk is not None:
                     geom[f] = t["geo_xy"][t["geo_off"][gk]:t["geo_off"][gk + 1]]
@@ -726,7 +757,8 @@ def build(src, out, bbox=None, workers=4, tmp=None, log=print, z=SHARD_ZOOM, roo
         if bbox is not None:
             clip = tuple(int(v[0]) for v in tile_ranges(*(np.array([v], np.float32) for v in bbox), z))
         paths, done, coarse, races = {}, 0, {}, []
-        jobs = [(src, rg, first, n, tmp, z, cz, clip) for rg, first, n, _ in groups]
+        have = columns_of(src)
+        jobs = [(src, rg, first, n, tmp, z, cz, clip, have) for rg, first, n, _ in groups]
         # (a fresh pool per chunk of DECODE_TASKS row groups a worker: max_tasks_per_child hung the planet build for good
         # right after its first workers were replaced, "decoded 50/2477" then 5 h of nothing, 2026-11-11)
         chunk = max(1, workers * DECODE_TASKS)
