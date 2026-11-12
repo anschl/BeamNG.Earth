@@ -586,6 +586,29 @@ class ChainTest(unittest.TestCase):
             self.assertEqual(len(im.fetch_later(f, *sq, px)), 1, "an expired 404 is asked again")
         self.assertTrue(done.wait(10))
 
+    def test_fetch_later_not_settled_without_the_coverage_probes(self):
+        """A whole USGS tile on disk whose coverage probe left the disk is not counted as filling its cells: a quick
+        render skips USGS there (it fetches no probe), so the background batch is started and fetches the probe."""
+        f = g.EnuFrame(LAT0, LON0)
+        sq, px = (-2048.0, -2048.0, 4096.0), 1024
+        im = FakeNet(self.tmp.name, self.tile, tone=0.0)
+        done = threading.Event()
+        im.add_img_listener(lambda token, changed: done.set())
+        self.assertEqual(len(im.fetch_later(f, *sq, px)), 1)
+        self.assertTrue(done.wait(10))
+        usgs = next(keys for _, s, _, keys, _ in im._needed(f, *sq, px, False) if s.name == "usgs")
+        probes = {im._probe_key(k) for k in usgs}
+        with im._lock:
+            im._lru.clear()
+        self.assertEqual(im.fetch_later(f, *sq, px), [], "settled")
+        for p in probes:
+            os.remove(im._paths(*p)[0])
+        done.clear()
+        self.assertEqual(len(im.fetch_later(f, *sq, px)), 1, "a probe gone: not settled")
+        self.assertTrue(done.wait(10))
+        self.assertTrue(all(im._on_disk(p) for p in probes))
+        self.assertEqual(im.fetch_later(f, *sq, px), [])
+
     @staticmethod
     def idle(im, timeout=5.0):
         t0 = time.monotonic()

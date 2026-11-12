@@ -1385,16 +1385,17 @@ class Imagery:
     def _known(self, keys):
         """fetch_later's look before its batch, reading no file: {key: Tile or None} of the keys in memory (a coverage
         probe in memory that says no data: None), _ON_DISK for a file on disk (_WHOLE_ON_DISK: it drew whole when it
-        was decoded), None for a 404 remembered and still valid (an expired one is asked again, as _download does)."""
-        out = {}
+        was decoded), None for a 404 remembered and still valid (an expired one is asked again, as _download does).
+        A tile whose coverage probes are not all in memory or on disk is left out (not known): a quick render does
+        not fetch them and skips the source there (tiles()), the batch does."""
+        out, probes = {}, {}
         with self._lock:
             for k in keys:
-                if k in self._lru:
-                    out[k] = self._lru[k]
-                    continue
                 p = self._probe_key(k)
                 if p is not None and p in self._lru and not self._covered(self._lru[p]):
                     out[k] = None
+                elif k in self._lru:
+                    out[k] = self._lru[k]
         for k in keys:
             if k not in out:
                 jpg, miss = self._paths(*k)
@@ -1402,7 +1403,23 @@ class Imagery:
                     out[k] = _WHOLE_ON_DISK if self._whole.get(k) else _ON_DISK
                 elif self.fetcher.miss_alive(miss, k[0].url):
                     out[k] = None
+            if out.get(k) is not None and not self._probes_at_hand(k, probes):
+                del out[k]
         return out
+
+    def _probes_at_hand(self, key, seen):
+        """A tile's coverage probe, the probe's probe and on (tiles() asks each, whether in memory or not), each in
+        memory or on disk. seen: probe -> verdict, shared by one _known call."""
+        p = self._probe_key(key)
+        while p is not None:
+            if p not in seen:
+                with self._lock:
+                    seen[p] = p in self._lru
+                seen[p] = seen[p] or self._on_disk(p)
+            if not seen[p]:
+                return False
+            p = self._probe_key(p)
+        return True
 
     def fetch_needed(self, frame, x0, y0, size, px, last_only=False, gutter=False):
         """Fetch (on demand, waiting) the source tiles render(frame, x0, y0, size, px) needs: the first source of the
