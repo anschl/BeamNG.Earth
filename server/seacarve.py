@@ -50,7 +50,7 @@ BATHY_DOWN = 4              # ~7.5 m pixels
 BATHY_MIN, BATHY_MAX = 1.0, 80.0    # m: a sea floor this deep at least / at most
 BATHY_RETRY_S = 120.0       # s: a cell built without bathymetry is built again after this (in memory)
 SHORE_SLOPE = 0.3           # m/m: with bathymetry, the floor reaches its depth from the shore this steeply
-RAW_MB = 1536               # the uncompressed rasters (memory-mapped; up to ~9.5 MB a cell) kept at most (earthd's start-up
+RAW_MB = 1536               # the uncompressed rasters (memory-mapped; up to ~7.4 MB a cell) kept at most (earthd's start-up
                             # prune: they grew to 13.7 GB on a Steam Deck beside 0.15 GB of the compressed ones they repeat)
 PX_ZOOM = 16                # raster pixels: Web-Mercator z16 (256 px tiles): 1024 px per z14 cell
 CELL_PX = 256 << (PX_ZOOM - mapcells.ZOOM)      # raster pixels per cell edge (1024)
@@ -126,10 +126,22 @@ EARTH_R = 6371000.0
 # Stored by RAW_BLOCK_PX blocks, only those with water (an index of the cell's blocks, slot 0 a land block they all
 # share): a whole 1026 px raster was 9.4 MB a cell, 3 % of its pixels water in a landlocked first visit (Czech D1,
 # 2026-11-05: 119 cells, 1.1 GB of SSD writes in 15 km; 10.7 % of the 32 px blocks hold any water).
-RAW_DTYPE = np.dtype([("depth", "<f4"), ("level", "<f4"), ("outline", "?")])
+# The depth in int16 centimetres, as the npz keeps it (the build rounds it to them: _depth_cm): 7 bytes a pixel, not 9.
+RAW_DTYPES = {0x53424b32: np.dtype([("depth", "<i2"), ("level", "<f4"), ("outline", "?")]),     # "2KBS"
+              0x53424b31: np.dtype([("depth", "<f4"), ("level", "<f4"), ("outline", "?")])}     # "1KBS": older copies
+RAW_MAGIC = 0x53424b32          # the file's first int32 (then block px, blocks a side, slots, raster px)
+RAW_DTYPE = RAW_DTYPES[RAW_MAGIC]
 RAW_BLOCK_PX = 32
-RAW_MAGIC = 0x53424b31          # "1KBS": the file's first int32 (then block px, blocks a side, slots, raster px)
 RAW_HEAD = 5                    # int32s before the index
+
+
+def _depth_cm(depth):
+    return np.round(depth * 100.0).astype(np.int16)
+
+
+def _depth_m(cm):
+    """The float32 depth of _depth_cm's centimetres: c / 100 exactly as the build rounds it."""
+    return cm.astype(np.float32) / 100.0
 
 
 def _raw_path(p):
@@ -142,17 +154,21 @@ class _Blocks:
     __slots__ = ("idx", "data", "shape", "dtype")
 
     def __init__(self, idx, data, shape):
-        self.idx, self.data, self.shape, self.dtype = idx, data, shape, data.dtype
+        self.idx, self.data, self.shape = idx, data, shape
+        self.dtype = np.dtype(np.float32) if data.dtype == np.int16 else data.dtype
+
+    def _read(self, v):
+        return _depth_m(v) if v.dtype == np.int16 else v    # (centimetres: 100k lookups no slower, a plane +0.3 ms)
 
     def __getitem__(self, key):
         j, i = key
         j, i = np.asarray(j), np.asarray(i)
         b = RAW_BLOCK_PX
-        return self.data[self.idx[j // b, i // b], j % b, i % b]
+        return self._read(self.data[self.idx[j // b, i // b], j % b, i % b])
 
     def __array__(self, dtype=None, copy=None):
         m, b = self.idx.shape[0], RAW_BLOCK_PX
-        a = self.data[self.idx].transpose(0, 2, 1, 3).reshape(m * b, m * b)[:self.shape[0], :self.shape[1]]
+        a = self._read(self.data[self.idx].transpose(0, 2, 1, 3).reshape(m * b, m * b)[:self.shape[0], :self.shape[1]])
         return a if dtype is None else a.astype(dtype)
 
 
@@ -164,7 +180,7 @@ def _write_raw(raw, r):
     m = -(-n // b)
     full = np.zeros((m * b, m * b), RAW_DTYPE)
     full["level"] = np.nan
-    full["depth"][:n, :n], full["level"][:n, :n], full["outline"][:n, :n] = r[0], r[1], r[2]
+    full["depth"][:n, :n], full["level"][:n, :n], full["outline"][:n, :n] = _depth_cm(r[0]), r[1], r[2]
     blocks = full.reshape(m, b, m, b).transpose(0, 2, 1, 3)        # (m, m, b, b)
     used = ((blocks["depth"] != 0) | np.isfinite(blocks["level"]) | blocks["outline"]).any(axis=(2, 3))
     idx = np.zeros((m, m), "<i4")
@@ -195,12 +211,13 @@ def _open_raw(raw):
         raise ValueError(f"not a raster: {buf.dtype} {buf.shape}")
     magic, b, m, k, n = (int(v) for v in buf[:4 * RAW_HEAD].view("<i4"))
     off = 4 * (RAW_HEAD + m * m)
-    if magic != RAW_MAGIC or b != RAW_BLOCK_PX or len(buf) != off + k * b * b * RAW_DTYPE.itemsize or not 0 < n <= m * b:
+    dt = RAW_DTYPES.get(magic)
+    if dt is None or b != RAW_BLOCK_PX or len(buf) != off + k * b * b * dt.itemsize or not 0 < n <= m * b:
         raise ValueError(f"not a raster: {magic:#x} {b} {m} {k} {n}")
     idx = np.array(buf[4 * RAW_HEAD:off].view("<i4").reshape(m, m))     # (small: read in, not mapped)
     if idx.min() < 0 or idx.max() >= k:
         raise ValueError("raster index out of range")
-    data = buf[off:].view(RAW_DTYPE).reshape(k, b, b)
+    data = buf[off:].view(dt).reshape(k, b, b)
     return tuple(_Blocks(idx, data[f], (n, n)) for f in ("depth", "level", "outline"))
 
 
@@ -491,7 +508,7 @@ class SeaCarver:
                 log.debug("sea: %s: %s", raw, e)
         if p and os.path.exists(p):
             # (a damaged file, empty or cut short after a crash: removed and built again, staging.read_npz)
-            got = staging.read_npz(p, lambda f: ((f["depth"].astype(np.float32) / 100.0, f["level"].astype(np.float32),
+            got = staging.read_npz(p, lambda f: ((_depth_m(f["depth"]), f["level"].astype(np.float32),
                                                   f["outline"].astype(bool)) if f["any"] else None,), "sea cell")
             if got is not None:
                 r = got[0]
@@ -506,7 +523,7 @@ class SeaCarver:
         r = self._build(x, y, with_bathy)
         complete = r is None or r[3]
         if r is not None:
-            r = (np.round(r[0] * 100.0).astype(np.float32) / 100.0, r[1], r[2])   # as the file gives back
+            r = (_depth_m(_depth_cm(r[0])), r[1], r[2])   # as the file gives back
         if p and complete:              # an incomplete raster (no bathymetry yet) is built again later
             os.makedirs(os.path.dirname(p), exist_ok=True)
             tmp = f"{p}.{os.getpid()}.{threading.get_ident()}.tmp"
@@ -514,7 +531,7 @@ class SeaCarver:
                 if r is None:
                     np.savez_compressed(fh, any=False)
                 else:
-                    np.savez_compressed(fh, any=True, depth=np.round(r[0] * 100.0).astype(np.int16), level=r[1],
+                    np.savez_compressed(fh, any=True, depth=_depth_cm(r[0]), level=r[1],
                                         outline=r[2])
             staging.replace_cached(tmp, p)
             if r is not None:

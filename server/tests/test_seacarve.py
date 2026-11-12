@@ -163,7 +163,7 @@ class SeaCarveTest(unittest.TestCase):
         depth = np.zeros((n, n), np.float32)
         level = np.full((n, n), np.nan, np.float32)
         outline = np.zeros((n, n), bool)
-        depth[100:140, 600:700] = rng.random((40, 100), np.float32) * 3     # a pond
+        depth[100:140, 600:700] = seacarve._depth_m(rng.integers(0, 300, (40, 100)))   # a pond (whole cm)
         level[98:142, 598:702] = 212.3
         outline[500:503, :] = True                                          # a river's outline across
         level[1020:, 1020:] = 0.0                                           # (a level of 0: not land)
@@ -185,6 +185,42 @@ class SeaCarveTest(unittest.TestCase):
                 fh.truncate()
             with self.assertRaises((ValueError, OSError)):   # Windows mmap rejects a truncated mapping with OSError
                 seacarve._open_raw(p)
+
+    def test_raw_copy_keeps_the_depth_in_centimetres(self):
+        """The raw copy's depth is int16 centimetres (7 bytes a pixel, not 9), read back bit for bit the float32 the
+        build and the npz give (every int16 value); an older copy of float32 metres reads as it did."""
+        n, b = 1026, seacarve.RAW_BLOCK_PX
+        m = -(-n // b)
+        cm = np.resize(np.arange(-32768, 32768, dtype=np.int16), (n, n))
+        depth = seacarve._depth_m(cm)
+        level = np.zeros((n, n), np.float32)
+        outline = np.zeros((n, n), bool)
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "c.rawb.npy")
+            seacarve._write_raw(p, (depth, level, outline))
+            k = m * m + 1                               # every block has water, and the land slot
+            self.assertEqual(np.load(p, mmap_mode="r").size, 4 * (seacarve.RAW_HEAD + m * m) + k * b * b * 7)
+            got = seacarve._open_raw(p)
+            self.assertEqual(got[0].dtype, np.float32)
+            np.testing.assert_array_equal(np.asarray(got[0]).view(np.uint32), depth.view(np.uint32))
+            j, i = np.arange(n), np.arange(n)[::-1]
+            np.testing.assert_array_equal(got[0][j, i].view(np.uint32), depth[j, i].view(np.uint32))
+            old = os.path.join(d, "old.rawb.npy")       # a float32 copy in a cache from before
+            dt = np.dtype([("depth", "<f4"), ("level", "<f4"), ("outline", "?")])
+            data = np.zeros((2, b, b), dt)
+            data["level"] = np.nan
+            data["depth"][1] = depth[:b, :b]
+            data["level"][1] = 0.0
+            idx = np.zeros((m, m), "<i4")
+            idx[0, 0] = 1
+            head = np.array([0x53424b31, b, m, 2, n], "<i4")
+            np.save(old, np.concatenate([head.view(np.uint8), idx.view(np.uint8).ravel(), data.view(np.uint8).ravel()]))
+            was = seacarve._open_raw(old)
+            np.testing.assert_array_equal(np.asarray(was[0])[:b, :b].view(np.uint32), depth[:b, :b].view(np.uint32))
+            self.assertEqual(float(was[0][b, b]), 0.0)
+            self.assertTrue(np.isnan(was[1][b, b]))
+            del got, was
+            gc.collect()        # (Windows removes no mapped file)
 
     def test_raw_copy_and_older_cells(self):
         """Read back memory-mapped (the raw copy) and from a cell cached before the raw copies (converted): the
