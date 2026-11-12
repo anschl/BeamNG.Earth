@@ -142,20 +142,22 @@ class OsmFuelVersionTest(unittest.TestCase):
         import osmfuel
         from types import SimpleNamespace
 
-        class Fetcher:
-            calls = 0
+        for refusal in (netfetch.Deferred, netfetch.RateLimited, netfetch.BudgetExceeded, netfetch.PolicyDenied):
+            with self.subTest(refusal.__name__):
+                class Fetcher:
+                    calls = 0
 
-            def get(self, url, kind=None, headers=None):
-                Fetcher.calls += 1
-                if kind == "prefetch":
-                    raise netfetch.Deferred("busy, prefetch dropped", url, "data.openstreetmap.us")
-                return SimpleNamespace(headers={"etag": '"v1"', "content-range": "bytes 0-15/9000000"})
-        d = tempfile.mkdtemp()
-        fuel, picnic = osmfuel.OsmFuel(d, Fetcher()), osmfuel.OsmFuel(d, Fetcher())
-        with self.assertRaises(netfetch.Deferred):
-            fuel.version("prefetch")
-        self.assertEqual(picnic.version("demand")[0], '"v1"', "the picnic tables' demand read still asks")
-        self.assertEqual(Fetcher.calls, 2)
+                    def get(self, url, kind=None, headers=None):
+                        Fetcher.calls += 1
+                        if kind == "prefetch":
+                            raise refusal("refused here", url, "data.openstreetmap.us")
+                        return SimpleNamespace(headers={"etag": '"v1"', "content-range": "bytes 0-15/9000000"})
+                d = tempfile.mkdtemp()
+                fuel, picnic = osmfuel.OsmFuel(d, Fetcher()), osmfuel.OsmFuel(d, Fetcher())
+                with self.assertRaises(refusal):
+                    fuel.version("prefetch")
+                self.assertEqual(picnic.version("demand")[0], '"v1"', "the picnic tables' demand read still asks")
+                self.assertEqual(Fetcher.calls, 2)
 
 
 class OsmFuelReadTest(unittest.TestCase):
