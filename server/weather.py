@@ -33,7 +33,7 @@ import netfetch
 log = logging.getLogger("earthd.weather")
 
 API = "https://api.open-meteo.com/v1/forecast"
-CURRENT = ("temperature_2m", "dew_point_2m", "relative_humidity_2m", "is_day", "precipitation", "rain",
+CURRENT = ("temperature_2m", "dew_point_2m", "is_day", "precipitation", "rain",
            "showers", "snowfall", "weather_code", "cloud_cover", "cloud_cover_low", "cloud_cover_mid",
            "cloud_cover_high", "surface_pressure", "wind_speed_10m", "wind_direction_10m", "wind_gusts_10m",
            "visibility")
