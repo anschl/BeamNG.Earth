@@ -406,17 +406,23 @@ class Archive:
         finally:
             for k in held:
                 xproc.release(lock(k))
+        # the others' tiles waited for under one deadline (not XPROC_WAIT_S each), then those still missing (a less
+        # urgent holder, a wait run out) read here in one batch as above (merged runs, not a request a tile); a lock
+        # taken meanwhile is let go at once: holding it while waiting for another could wait two processes out
+        until = time.monotonic() + XPROC_WAIT_S
+        missing = []
         for k in keys:
             if k in out:
                 continue
-            b, mine = xproc.once(lock(k), lambda k=k: self._disk_tile(k), XPROC_WAIT_S, kind)
+            b, mine = xproc.once(lock(k), lambda k=k: self._disk_tile(k), max(0.0, until - time.monotonic()), kind)
+            if mine:
+                xproc.release(lock(k))
             if b is None:
-                try:
-                    b = self._fetch([k], kind)[k]
-                finally:
-                    if mine:
-                        xproc.release(lock(k))
-            out[k] = b
+                missing.append(k)
+            else:
+                out[k] = b
+        if missing:
+            out.update(self._fetch(missing, kind))
         return out
 
     def _fetch(self, keys, kind):

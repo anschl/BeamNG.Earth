@@ -361,6 +361,27 @@ class FetchOnceTest(Base):
         self.assertEqual(len(f.seen), n + 1)            # (A's read alone)
         self.assertFalse(os.path.exists(arch._tile_path(*EAST) + ".lock"))
 
+    def test_tiles_others_never_deliver_are_read_in_one_batch_after_one_wait(self):
+        """Holders that never write: their tiles are waited for under one deadline (not XPROC_WAIT_S a tile), then read
+        together (one _fetch: merged runs), not one request a tile."""
+        r, f = self.reader({"transportation.pmtiles": archive(transportation())})
+        arch = r.archive("transportation")
+        arch.head("demand")
+        for k in (A, EAST):
+            lock = arch._tile_path(*k) + ".lock"
+            os.makedirs(os.path.dirname(lock), exist_ok=True)
+            self.assertTrue(xproc.take(lock))
+            self.addCleanup(xproc.release, lock)
+        calls = []
+        fetch = arch._fetch
+        arch._fetch = lambda keys, kind: calls.append(sorted(keys)) or fetch(keys, kind)
+        t0 = time.monotonic()
+        with mock.patch.object(pmtiles, "XPROC_WAIT_S", 0.3):
+            got = arch.tiles([A, EAST], "demand")
+        self.assertLess(time.monotonic() - t0, 0.55, "one wait for both")
+        self.assertEqual(calls, [sorted([A, EAST])])
+        self.assertEqual(gzip.decompress(got[EAST]), transportation()[EAST])
+
     def test_a_leaf_another_process_is_reading_is_waited_for(self):
         a = archive(transportation(), leaf=True)
         h = fast._ef.pmt_header(a)
