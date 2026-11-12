@@ -51,6 +51,9 @@ import roadz
 
 log = logging.getLogger("earthd.areas")
 
+# the errors a step waits on (_step) rather than skips
+WAITS = (netfetch.Offline, netfetch.BudgetExceeded, netfetch.Deferred, netfetch.RateLimited)
+
 SUBDIR = "areas"
 STORE = "areas.json"
 STORE_VERSION = 1
@@ -61,6 +64,13 @@ PIN_SHARE = 0.9             # saved areas may pin at most this share of the cach
 NAME_MAX = 60
 CELL_Z = 14                 # map data cells (mapcells.ZOOM)
 CELL_RING = 2               # cells round the box (roads, bridges and buildings reaching in)
+# The cells' map tiles are fetched an aligned block of 2^TILE_BLOCK x 2^TILE_BLOCK cells at a time, before the block's
+# first cell is built (CellTiles): such a block is one stretch of a PMTiles archive (Hilbert order), so its tiles come
+# in a few range reads instead of about one a cell and theme (a synthetic archive, 2026-11-12: 16 x 16 cells 295 reads
+# cell by cell, 38 in 16 x 16 blocks, as many as the whole area at once; 59 in 8 x 8 blocks, the reads round each
+# block's edge most of them: test_pmtiles AreaTilesTest)
+TILE_BLOCK = 4
+TILE_READS_FAST = 4         # fast mode: a block's range reads at once (each mirror's netfetch max_conc still holds)
 DEM_ZOOMS_FAR = (12, 13, 14)    # the far rings' and the ground filter's zooms (dem.GLOBAL_ZOOM ..)
 DEM_RING = 1                # z12 tiles round the box (the ground filter's neighbours)
 IMG_PARENT_Z = 13           # the imagery is walked in squares of this zoom
@@ -826,6 +836,7 @@ class Areas:
         if any(st[0] == "geo" for st in steps):
             self._write_world(a["id"], world)
         a["_world"] = world
+        a["_tiles"] = CellTiles(todo)
         with self.lock:
             a["state"] = "running"
         self._changed(force=True)
@@ -975,6 +986,7 @@ class Areas:
             return
         if kind == "cell":
             import mapcells
+            self._cell_tiles(a, st)
             key = mapcells.CellKey(st[1], st[2], st[3])
             if self.s.mapdata.predownload(key, st[4]) and self.s.cache is not None and hasattr(self.s.cache, "wrote"):
                 self.s.cache.wrote(self.s.mapdata.path(key, st[4]))     # (counted against the cap from now on)
@@ -999,6 +1011,60 @@ class Areas:
                     if got:
                         break
             self._mark_done(a["id"], img_key(st))
+
+    def _cell_tiles(self, a, st):
+        """The map tiles of the cell step's block (CellTiles), each range read behind the area's gates. Only the waits
+        (_step's) are raised: any other failure leaves the block's cells to their own reads (and their parquet
+        fallback), as before."""
+        batch = getattr(self.s.mapdata, "tiles_predownload", None)
+        tiles = a.get("_tiles")
+        if batch is None or tiles is None:
+            return
+        fast = self.is_fast(a)
+        last = []                       # (when the read before began: paced as imagery's)
+
+        def before_read():
+            if last:
+                self._pace(last[0], a)
+            if not self._gate(a):
+                raise netfetch.Deferred("area paused")
+            last[:] = [time.monotonic()]
+
+        def fetch(needs):
+            try:
+                batch(needs, before_read=before_read, width=TILE_READS_FAST if fast else 1)
+            except WAITS:
+                raise
+            except Exception as e:
+                log.debug("areas: %s map tiles of %s: %s: %s", a["id"], st[1:4], type(e).__name__, e)
+        tiles.ensure(st, fetch)
+
+
+class CellTiles:
+    """A pass's cell steps by block of cells (TILE_BLOCK): ensure(step, fetch) runs fetch(the block's [((z, x, y),
+    layer)]) once, before the block's first cell is built; a fetch that raised is run again by the next step (what it
+    read is on disk). Other threads (fast mode) wait for it: their cells' tiles are in it."""
+
+    def __init__(self, steps):
+        self._blocks = {}
+        for st in steps:
+            if st[0] == "cell":
+                self._block(st, create=True)["needs"].append((tuple(st[1:4]), st[4]))
+
+    def _block(self, st, create=False):
+        k = (st[1], st[2] >> TILE_BLOCK, st[3] >> TILE_BLOCK)
+        if create:
+            return self._blocks.setdefault(k, {"lock": threading.Lock(), "done": False, "needs": []})
+        return self._blocks.get(k)
+
+    def ensure(self, st, fetch):
+        b = self._block(st)
+        if b is None or b["done"]:
+            return
+        with b["lock"]:
+            if not b["done"]:
+                fetch(b["needs"])
+                b["done"] = True
 
 
 def img_key(step):

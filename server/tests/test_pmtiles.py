@@ -613,5 +613,98 @@ class MapDataTest(Base):
         self.assertNotIn("overture-pmt", md.path(CELL, "roads"))
 
 
+class AreaTilesTest(Base):
+    """A saved area's cells (areas.py): their tiles a block at a time (MapData.tiles_predownload: located, then a range
+    read at a time) instead of each cell's 3 x 3 on its own; the same tiles and cells."""
+    N = 16                              # an aligned block of cells (areas.TILE_BLOCK)
+    X0, Y0 = CELL.x & ~15, CELL.y & ~15
+
+    def setUp(self):
+        super().setUp()
+        self.enterContext(mock.patch.object(mapdata, "MAP_SOURCE", "pmtiles"))
+        # tiles of ~1.7 KB (gzip) in and round the block; reads merged across 512 B, 50 KB at most: as a real
+        # archive's 64 KB and 8 MB are to its ~0.2-0.3 MB tiles
+        self.enterContext(mock.patch.object(pmtiles, "MERGE_GAP", 512))
+        self.enterContext(mock.patch.object(pmtiles, "MAX_RUN", 50 * 1024))
+        rnd = np.random.default_rng(7)
+        tiles = {(14, x, y): mvt({"segment": [(2, [[(100, 100), (900, 900)]],
+                                               {"id": f"r{x}-{y}", "subtype": "road", "class": "residential",
+                                                "pad": rnd.bytes(1500).hex()})]})
+                 for x in range(self.X0 - 4, self.X0 + self.N + 4) for y in range(self.Y0 - 4, self.Y0 + self.N + 4)}
+        self.files = {"transportation.pmtiles": archive(tiles, leaf=True)}
+        self.cells = [mapcells.CellKey(14, self.X0 + i, self.Y0 + j) for j in range(self.N) for i in range(self.N)]
+
+    def md(self, name):
+        f = FakeFetcher(self.files)
+        md = mapdata.MapData(cache_dir=os.path.join(self.tmp, name), fetcher=f)
+        self.addCleanup(md.close)
+        md._osm_cell = lambda key, kind: ({}, [])
+        md.osmtags = mock.Mock(highway_geometry=lambda *a, **k: {})
+        md.pmtiles.archive("transportation").head("predownload")
+        f.seen.clear()
+        return md, f
+
+    def stored(self, md):
+        d = md.pmtiles.archive("transportation").dir
+        out = {}
+        for root, _, names in os.walk(os.path.join(d, "tiles")):
+            for n in names:
+                out[os.path.relpath(os.path.join(root, n), d)] = Path(root, n).read_bytes()
+        return out
+
+    def test_a_block_in_a_few_reads_with_the_same_tiles_and_cells(self):
+        one, f1 = self.md("cell-by-cell")
+        for c in self.cells:
+            one.predownload(c, "roads")
+        block, f2 = self.md("block")
+        asked = block.tiles_predownload([(c, "roads") for c in self.cells], before_read=lambda: None)
+        self.assertEqual(asked, (self.N + 2) ** 2)
+        reads = len(f2.seen)
+        for c in self.cells:
+            block.predownload(c, "roads")
+        self.assertEqual(len(f2.seen), reads, "the cells read nothing more")
+        # (2026-11-12: 256 cells cell by cell 295 reads, as a block 38)
+        self.assertLessEqual(len(f2.seen) * 6, len(f1.seen), (len(f1.seen), len(f2.seen)))
+        self.assertEqual(self.stored(one), self.stored(block))
+        for c in self.cells:
+            (a, _), (b, _) = one.layer_arrays(c, "roads"), block.layer_arrays(c, "roads")
+            self.assertEqual(mapdata.digest_arrays(a), mapdata.digest_arrays(b))
+
+    def test_reads_are_bounded(self):
+        md, f = self.md("bounded")
+        arch = md.pmtiles.archive("transportation")
+        groups = arch.ranges({(14, self.X0 + i, self.Y0 + j) for i in range(self.N) for j in range(self.N)},
+                             "predownload")
+        self.assertEqual(sorted(k for g in groups for k in g),
+                         sorted((14, self.X0 + i, self.Y0 + j) for i in range(self.N) for j in range(self.N)))
+        for g in groups:
+            where = [arch.locate(*k, "predownload") for k in g]
+            self.assertLessEqual(max(o + n for o, n in where) - min(o for o, _ in where), pmtiles.MAX_RUN)
+        self.assertGreater(len(groups), 1)
+
+    def test_a_live_read_of_a_tile_in_flight_waits_for_the_areas_read(self):
+        md, f = self.md("concurrent")
+        get = f.get
+
+        def slow_get(url, **kw):
+            time.sleep(0.3)
+            return get(url, **kw)
+        f.get = slow_get
+        arch = md.pmtiles.archive("transportation")
+        tile = (14, self.X0 + 3, self.Y0 + 3)
+        off, ln = arch.locate(*tile, "predownload")
+        f.seen.clear()
+        t = threading.Thread(target=md.tiles_predownload, args=([(mapcells.CellKey(*tile), "roads")],))
+        t.start()
+        time.sleep(0.1)                 # (the area's read on the wire)
+        live = arch.tiles([tile], "demand")[tile]
+        t.join()
+        covering = [rg for _, _, rg in f.seen
+                    if int(rg[6:].split("-")[0]) <= off < int(rg[6:].split("-")[1]) + 1]
+        self.assertEqual(len(covering), 1, f.seen)
+        self.assertEqual(live, Path(arch._tile_path(*tile)).read_bytes())
+
+
+
 if __name__ == "__main__":
     unittest.main()

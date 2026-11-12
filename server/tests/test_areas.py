@@ -262,6 +262,41 @@ class AreasTest(unittest.TestCase):
         self.assertEqual(b.areas[0]["failedPasses"], 0, "Resume: new tries")
         self.assertEqual(b.message()["areas"][0]["msg"], "")
 
+    def test_the_cells_map_tiles_come_a_block_at_a_time(self):
+        """The cells' map tiles are fetched a block of cells at a time (MapData.tiles_predownload: a few range reads,
+        not a few a cell), each block's before its first cell is built; a refused batch is asked again, a failed one
+        leaves its cells to their own reads."""
+        class BatchMapData(StubMapData):
+            def __init__(self):
+                super().__init__()
+                self.batches, self.fail = [], []
+
+            def tiles_predownload(self, needs, before_read=None, width=1):
+                if self.fail:
+                    raise self.fail.pop(0)
+                before_read()
+                self.batches.append((len(self.got), sorted(needs)))
+                return len(needs)
+        s = StubServer()
+        s.mapdata = BatchMapData()
+        s.mapdata.fail = [netfetch.Deferred("bucket low"), netfetch.HostUnavailable("down")]
+        a, _ = self.make(server=s, start=True)
+        a.add(*BOX)
+        self.assertTrue(wait_for(lambda: a.message()["areas"][0]["state"] == "done"))
+        m = a.message()["areas"][0]
+        self.assertEqual((m["done"], m["total"], m.get("unavailable") or 0), (len(a.steps(BOX)),) * 2 + (0,))
+        cells = [st for st in a.steps(BOX) if st[0] == "cell"]
+        self.assertEqual(sorted(s.mapdata.got), sorted((st[1:4], st[4]) for st in cells), "every cell built")
+        blocks = {}
+        for st in cells:
+            blocks.setdefault((st[2] >> areas.TILE_BLOCK, st[3] >> areas.TILE_BLOCK), []).append((st[1:4], st[4]))
+        self.assertGreater(len(blocks), 1)
+        # the refused first block asked again; the failed one (HostUnavailable) not again: its cells read their own
+        self.assertEqual(len(s.mapdata.batches), len(blocks) - 1)
+        for built, needs in s.mapdata.batches:
+            self.assertIn(needs, [sorted(b) for b in blocks.values()])
+            self.assertFalse(set(needs) & set(s.mapdata.got[:built]), "before any of its cells")
+
     def test_refused_requests_wait_and_budgets_wait_for_tomorrow(self):
         s = StubServer()
         for st in areas.Areas(self.tmp.name, s).steps(BOX):     # (only the DEM left to fetch)

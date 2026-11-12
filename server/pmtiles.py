@@ -74,7 +74,9 @@ POINT_LAYERS = ("connectors", "places")    # (their cell's tile alone; the other
                                            # features that cross its edges end in them, one round instead of two)
 MAX_ROUNDS = 8              # fetch rounds per layer (each the tiles the features still need)
 HEAD_BYTES = 16384          # the first read of an archive: header (127 B) + root directory
-MERGE_GAP = 64 * 1024       # tiles closer than this in the archive are read in one range
+MERGE_GAP = 64 * 1024       # tiles closer than this in the archive are read in one range ...
+MAX_RUN = 8 * 1024 * 1024   # ... of at most this many bytes (a saved area's block of tiles: several ranges; a range
+                            # that fails is read again whole)
 RANK_TTL_S = 6 * 3600.0
 DEMOTE_S = 300.0
 MEM_TILES_MB = 96           # tiles (as stored) kept in memory per process
@@ -425,35 +427,55 @@ class Archive:
             out.update(self._fetch(missing, kind))
         return out
 
-    def _fetch(self, keys, kind):
-        h, _root, etag = self.head(kind)
+    def _pooled(self, fn, items):
+        """fn over items on the fetch pool, with the caller's netfetch "quiet" state."""
         quiet = getattr(netfetch._quiet, "on", False)
 
-        def pooled(fn, items):          # (on the fetch pool, with the caller's netfetch "quiet" state)
-            def run(it):
-                prev = getattr(netfetch._quiet, "on", False)
-                netfetch._quiet.on = quiet
-                try:
-                    return fn(it)
-                finally:
-                    netfetch._quiet.on = prev
-            return list(self.r.pool.map(run, items)) if len(items) > 1 else [fn(it) for it in items]
-        # (their leaf directories at once: neighbours may sit in different leaves)
-        where = dict(zip(keys, pooled(lambda k: self.locate(*k, kind), keys)))
-        out = {k: b"" for k, w in where.items() if w is None}
-        runs = []                       # [start, end, [(key, offset, length)]]
+        def run(it):
+            prev = getattr(netfetch._quiet, "on", False)
+            netfetch._quiet.on = quiet
+            try:
+                return fn(it)
+            finally:
+                netfetch._quiet.on = prev
+        return list(self.r.pool.map(run, items)) if len(items) > 1 else [fn(it) for it in items]
+
+    def _locate_all(self, keys, kind):
+        """{key: (offset, length) or None}: their leaf directories at once (neighbours may sit in different leaves)."""
+        return dict(zip(keys, self._pooled(lambda k: self.locate(*k, kind), keys)))
+
+    @staticmethod
+    def _runs(where):
+        """The located tiles as range reads, in archive order: [start, end, [(key, offset, length)]] (MERGE_GAP,
+        MAX_RUN)."""
+        runs = []
         for k, (off, ln) in sorted(((k, w) for k, w in where.items() if w is not None), key=lambda kv: kv[1]):
-            if runs and off - runs[-1][1] <= MERGE_GAP:
+            if runs and off - runs[-1][1] <= MERGE_GAP and max(runs[-1][1], off + ln) - runs[-1][0] <= MAX_RUN:
                 runs[-1][1] = max(runs[-1][1], off + ln)
                 runs[-1][2].append((k, off, ln))
             else:
                 runs.append([off, off + ln, [(k, off, ln)]])
+        return runs
+
+    def ranges(self, zxys, kind):
+        """The tiles of zxys not in memory or on disk, grouped as _fetch reads them (one range read a group; those the
+        archive has none of in a group of their own, no read), in archive order."""
+        todo = [k for k in sorted(set(zxys))
+                if self.r.mem_get((self.theme, k)) is None and not os.path.exists(self._tile_path(*k))]
+        where = self._locate_all(todo, kind)
+        none = [k for k, w in where.items() if w is None]
+        return ([none] if none else []) + [[k for k, _, _ in items] for _, _, items in self._runs(where)]
+
+    def _fetch(self, keys, kind):
+        h, _root, etag = self.head(kind)
+        where = self._locate_all(keys, kind)
+        out = {k: b"" for k, w in where.items() if w is None}
 
         def one(run):
             a, b, items = run
             body, _ = self._get(a, b, kind, etag)
             return {k: body[off - a:off - a + ln] for k, off, ln in items}
-        for got in pooled(one, runs):
+        for got in self._pooled(one, self._runs(where)):
             out.update(got)
         for k in keys:
             b = out[k]
@@ -522,17 +544,45 @@ class Reader:
         ahead (earthd download_ahead) asked each cell's 3 x 3 tiles on its own, several range reads where one or two
         would do (the retro optimization study's section N: a round trip costs as much as ~1 MB). Returns the tiles
         asked for."""
-        want = {}
-        for cell, layer in needs:
-            if layer not in LAYERS:
-                continue
-            theme, ts = self.tiles_for(layer, cell)
-            want.setdefault(theme, set()).update(ts)
         n = 0
-        for theme, ts in want.items():
+        for theme, ts in self._first_tiles(needs).items():
             self.archive(theme).tiles(ts, kind)
             n += len(ts)
         return n
+
+    def predownload(self, needs, before_read=None, width=1):
+        """A saved area's block of cells (areas.py, through MapData.tiles_predownload): the first tiles of every
+        (cell, layer) in needs located (their directories), then read a range at a time, width at once (Archive.ranges:
+        tiles near each other in the archive in one, MAX_RUN at most), each through Archive.tiles: its tiles alone are
+        held against the server's other readers (the in-flight guards, xproc), so a live cell that wants one waits for
+        one range, never reads it again. before_read() before each read (the area's gates; it may raise). Returns the
+        tiles asked for."""
+        n = 0
+        for theme, ts in self._first_tiles(needs).items():
+            arch = self.archive(theme)
+
+            def one(group, arch=arch):
+                if before_read is not None:
+                    before_read()
+                arch.tiles(group, "predownload")
+            groups = arch.ranges(ts, "predownload")
+            if width > 1 and len(groups) > 1:   # (a pool of its own: Archive.tiles uses self.pool)
+                with ThreadPoolExecutor(min(width, len(groups)), thread_name_prefix="pmtiles-area") as ex:
+                    list(ex.map(one, groups))
+            else:
+                for g in groups:
+                    one(g)
+            n += len(ts)
+        return n
+
+    def _first_tiles(self, needs):
+        """{theme: {(z, x, y)}} that query() reads first for the (cell, layer)s in needs (tiles_for)."""
+        want = {}
+        for cell, layer in needs:
+            if layer in LAYERS:
+                theme, ts = self.tiles_for(layer, cell)
+                want.setdefault(theme, set()).update(ts)
+        return want
 
     def query(self, layer, cell, kind="demand"):
         """The layer's Features of one cell (lon/lat; mapdata localises and marks `own`) and {(dataset, license):

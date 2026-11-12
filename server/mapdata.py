@@ -1314,10 +1314,21 @@ class MapData:
         """The map tiles of the (cell, layer)s in needs not on disk yet fetched in batches (pmtiles.Reader.prefetch:
         neighbouring tiles in one range read) before they are built cell by cell. No-op without the tiles source.
         Returns the tiles asked for."""
-        if getattr(self, "pmtiles", None) is None:
-            return 0
-        todo = [(_key(k), ly) for k, ly in needs if MapData._pmt(self, ly) and not self.has(_key(k), ly)]
+        todo = self._tile_needs(needs)
         return self.pmtiles.prefetch(todo, kind) if todo else 0
+
+    def tiles_predownload(self, needs, before_read=None, width=1):
+        """A saved area's block of cells (areas.py): the map tiles of the (cell, layer)s in needs not on disk yet
+        fetched a range read at a time, width at once (pmtiles.Reader.predownload), before the cells are built one by
+        one. before_read() before each read. No-op without the tiles source. Returns the tiles asked for."""
+        todo = self._tile_needs(needs)
+        return self.pmtiles.predownload(todo, before_read, width) if todo else 0
+
+    def _tile_needs(self, needs):
+        """The (cell, layer)s of needs that come from the tiles and are not on disk yet."""
+        if getattr(self, "pmtiles", None) is None:
+            return []
+        return [(_key(k), ly) for k, ly in needs if MapData._pmt(self, ly) and not self.has(_key(k), ly)]
 
     def side_prefetch(self, keys):
         """The side_sources' background reads of these cells (a road tile's own) started now, without waiting; France's
