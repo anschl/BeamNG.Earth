@@ -30,6 +30,7 @@ import mapgeom as mg  # noqa: E402
 import netfetch  # noqa: E402
 import pmtiles  # noqa: E402
 import revisit  # noqa: E402
+import xproc  # noqa: E402
 
 EXT = 4096
 CELL = mapcells.CellKey(14, 4706, 6245)        # Fells Point, Baltimore
@@ -333,6 +334,45 @@ class FetchOnceTest(Base):
         leaf = f"bytes={h['leaf_offset']}-{h['leaf_offset'] + h['leaf_length'] - 1}"
         self.assertEqual(sum(rg == leaf for _, _, rg in f.seen), 1)
 
+
+    def another_process(self, files, lock):
+        """Another of the server's processes holding lock (xproc) while it writes files {path: bytes}."""
+        self.assertTrue(xproc.take(lock))
+
+        def done():
+            time.sleep(0.3)
+            for p, b in files.items():
+                pmtiles._write(p, b)
+            xproc.release(lock)
+        t = threading.Thread(target=done)
+        t.start()
+        self.addCleanup(t.join)
+
+    def test_a_tile_another_process_is_reading_is_waited_for(self):
+        r, f = self.reader({"transportation.pmtiles": archive(transportation())})
+        arch = r.archive("transportation")
+        arch.head("demand")
+        n = len(f.seen)
+        theirs = gzip.compress(transportation()[EAST], mtime=0)
+        self.another_process({arch._tile_path(*EAST): theirs}, arch._tile_path(*EAST) + ".lock")
+        got = arch.tiles([A, EAST], "demand")
+        self.assertEqual(got[EAST], theirs)
+        self.assertEqual(gzip.decompress(got[A]), transportation()[A])
+        self.assertEqual(len(f.seen), n + 1)            # (A's read alone)
+        self.assertFalse(os.path.exists(arch._tile_path(*EAST) + ".lock"))
+
+    def test_a_leaf_another_process_is_reading_is_waited_for(self):
+        a = archive(transportation(), leaf=True)
+        h = fast._ef.pmt_header(a)
+        r, f = self.reader({"transportation.pmtiles": a})
+        arch = r.archive("transportation")
+        arch.head("demand")
+        n = len(f.seen)
+        off, ln = 0, h["leaf_length"]
+        path = os.path.join(arch.dir, "leaf", f"{off}_{ln}")
+        self.another_process({path: a[h["leaf_offset"]:h["leaf_offset"] + ln]}, path + ".lock")
+        self.assertIsNotNone(arch.locate(*A, "demand"))
+        self.assertEqual(len(f.seen), n)
 
 class RoadsTest(Base):
     def setUp(self):

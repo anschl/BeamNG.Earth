@@ -16,6 +16,7 @@ tiles near each other in the archive in one), at most MAX_ROUNDS rounds and CAP 
                                          /head.json        its ETag (every later read must match it)
                                          /leaf/<off>_<len>  leaf directories, as stored (gzip)
                                          /tiles/<z>/<x>/<y>.mvt  tiles, as stored (gzip; empty: none in the archive)
+                                         (<file>.lock: another of the server's processes is reading it, xproc)
   <raw>/overture-pmtiles/mirrors.json                       the mirrors' order by their measured answer time
 
 Mirrors (MIRRORS): Overture's tile CDN (tiles.overturemaps.org, the explorer's own: ~55 ms to the first byte from the
@@ -48,6 +49,7 @@ import mapgeom as mg
 import netfetch
 import overture
 import staging
+import xproc
 
 log = logging.getLogger("earthd.mapdata")
 
@@ -77,6 +79,7 @@ RANK_TTL_S = 6 * 3600.0
 DEMOTE_S = 300.0
 MEM_TILES_MB = 96           # tiles (as stored) kept in memory per process
 FETCH_THREADS = 8
+XPROC_WAIT_S = 60.0         # a tile or leaf another of the server's processes is fetching is waited for this long (xproc)
 
 
 def source_key():
@@ -301,9 +304,18 @@ class Archive:
         return b if b is not None and len(b) == ln else None
 
     def _leaf_fetch(self, path, off, ln, kind, etag):
-        h = self._head[0]
-        b, _ = self._get(h["leaf_offset"] + off, h["leaf_offset"] + off + ln, kind, etag)
-        _write(path, b)
+        """The leaf from the network into path, unless another of the server's processes is reading it: its file
+        then (xproc)."""
+        b, mine = xproc.once(path + ".lock", lambda: self._leaf_disk(path, ln), XPROC_WAIT_S, kind)
+        if b is not None:
+            return b
+        try:
+            h = self._head[0]
+            b, _ = self._get(h["leaf_offset"] + off, h["leaf_offset"] + off + ln, kind, etag)
+            _write(path, b)
+        finally:
+            if mine:
+                xproc.release(path + ".lock")
         return b
 
     def locate(self, z, x, y, kind):
@@ -351,7 +363,7 @@ class Archive:
                     theirs.append((k, ev))
         try:
             if mine:
-                out.update(self._fetch(mine, kind))
+                out.update(self._fetch_shared(mine, kind))
         finally:
             with self._lock:
                 for k in mine:
@@ -363,6 +375,47 @@ class Archive:
                 b = _read(self._tile_path(*k))
             if b is None:
                 b = self._fetch([k], kind)[k]
+            out[k] = b
+        return out
+
+    def _disk_tile(self, k):
+        b = _read(self._tile_path(*k))
+        if b is not None:
+            self.r.mem_put((self.theme, k), b)
+        return b
+
+    def _fetch_shared(self, keys, kind):
+        """_fetch of keys across the server's processes (xproc, as rangeread's blocks): earthd's warm() and each road
+        worker's ask overlapping cells at once (neighbour cells share 6 of their 9 tiles), and each process read the
+        same tiles. Those no other process is fetching are read here in one batch, the lock next to each tile's file;
+        the others' files waited for (one a less urgent process holds, or that never came: read here)."""
+        def lock(k):
+            return self._tile_path(*k) + ".lock"
+        held = [k for k in keys if xproc.take(lock(k), kind)]
+        out = {}
+        try:
+            need = []
+            for k in held:              # (stored by a process that let go of its lock between our disk look and take())
+                b = self._disk_tile(k)
+                if b is None:
+                    need.append(k)
+                else:
+                    out[k] = b
+            if need:
+                out.update(self._fetch(need, kind))
+        finally:
+            for k in held:
+                xproc.release(lock(k))
+        for k in keys:
+            if k in out:
+                continue
+            b, mine = xproc.once(lock(k), lambda k=k: self._disk_tile(k), XPROC_WAIT_S, kind)
+            if b is None:
+                try:
+                    b = self._fetch([k], kind)[k]
+                finally:
+                    if mine:
+                        xproc.release(lock(k))
             out[k] = b
         return out
 
