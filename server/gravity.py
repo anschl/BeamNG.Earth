@@ -507,9 +507,10 @@ def ensure_egm2008(cache_dir=CACHE_DIR, log=print, net=None):
     os.makedirs(cache_dir, exist_ok=True)
     npy = os.path.join(cache_dir, "egm2008_rowmajor.npy")
     meta = os.path.join(cache_dir, "egm2008_rowmajor.json")
-    if os.path.exists(npy) and os.path.exists(meta):
-        return npy
     arc = os.path.join(cache_dir, "egm2008.tar.bz2")
+    if os.path.exists(npy) and os.path.exists(meta):
+        _drop(arc)                  # (an install from before the archive was dropped after converting)
+        return npy
     if not os.path.exists(arc):
         log(f"gravity: downloading EGM2008 coefficients (74 MB, once) to {cache_dir}")
         _download(EGM2008_URL, arc, EGM2008_SHA256, EGM2008_SIZE, log=log, net=net)
@@ -530,7 +531,17 @@ def ensure_egm2008(cache_dir=CACHE_DIR, log=print, net=None):
                    "corr_nmax": d["corr_nmax"], "rows": ["c", "s", "corr_c", "corr_s"],
                    "layout": "row-major triangle, index n(n+1)/2+m, fully normalised, tide-free",
                    "gm": EGM2008_GM, "a": EGM2008_A, "height_offset": EGM2008_HEIGHT_OFFSET}, f)
+    # The archive is read only here: once converted it was 72 MB of the cache for good (the converted coefficients
+    # rebuild the derived tables; were they lost, the archive is downloaded again)
+    _drop(arc)
     return npy
+
+
+def _drop(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 # The built model's tables kept on disk and memory-mapped (load_egm2008): kept in memory they were ~128 MB of the

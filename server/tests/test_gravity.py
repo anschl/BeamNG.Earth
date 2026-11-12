@@ -505,6 +505,16 @@ class DownloadTlsTest(unittest.TestCase):
 
 
 
+class ArchiveDroppedTest(unittest.TestCase):
+    def test_converted_coefficients_drop_the_archive(self):
+        """The archive is only read to convert it: with the converted coefficients there, it leaves the cache."""
+        with tempfile.TemporaryDirectory() as d:
+            for n in ("egm2008_rowmajor.npy", "egm2008_rowmajor.json", "egm2008.tar.bz2"):
+                Path(d, n).write_bytes(b"x")
+            self.assertEqual(G.ensure_egm2008(d, log=lambda *a: None), os.path.join(d, "egm2008_rowmajor.npy"))
+            self.assertFalse(os.path.exists(os.path.join(d, "egm2008.tar.bz2")))
+
+
 class DerivedTablesTest(unittest.TestCase):
     """The built model's tables written to the cache and memory-mapped back (load_egm2008 mapped=True): the same
     field to the bit, the big tables file-backed (~128 MB of the main process at degree 2190 otherwise)."""
