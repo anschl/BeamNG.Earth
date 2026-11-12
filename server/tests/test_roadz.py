@@ -242,8 +242,10 @@ class PartsTest(unittest.TestCase):
             self.assertEqual(len(asked), 2, "the second read from disk")
             np.testing.assert_array_equal(a[0], b[0])
             np.testing.assert_array_equal(a[1], b[1])
-            provider()._read("USGS_X", ["0-0-0-0"], [(1000.0, 2000.0, 1070.0, 2010.0)], key)
-            self.assertEqual(len(asked), 3, "other boxes (another bridge, a changed map) read their own")
+            c = provider()._read("USGS_X", ["0-0-0-0"], [(1000.0, 2000.0, 1070.0, 2010.0)], key)
+            self.assertEqual(len(asked), 2, "other boxes (another bridge, a changed map): the node's kept .laz")
+            self.assertEqual(len(c[0]), 2, "their own points")
+            self.assertEqual(len(self._parts(d, key)), 3)
 
     def test_a_node_two_cells_share_is_read_once(self):
         """Neighbouring cells' boxes share EPT nodes: a node this process read for one cell is not downloaded again for
@@ -278,6 +280,7 @@ class PartsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             asked = []
             rz = roadz.RoadZ(d, None)
+            rz._nodes = None                # (the parts' claims only: no node's .laz kept)
             rz._fetch = lambda url, headers=None, lane=None: asked.append(url) or las_bytes(
                 [(100, 200, 550, 2), (5000, 200, 900, 17)])
             key = mapcells.CellKey(14, 4683, 6266)
@@ -323,6 +326,55 @@ class PartsTest(unittest.TestCase):
             self.assertEqual(len(asked), 4)
             np.testing.assert_array_equal(a[0], c[0])
             self.assertFalse(os.path.exists(p1 + ".lock"))
+
+    def test_a_node_is_downloaded_once_for_every_process(self):
+        """A node's .laz is kept on disk (RoadZ._node_kept): another process, or a later run, building a neighbouring
+        cell does not download it again, and its points are the same as from the download."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            asked = []
+
+            def provider():
+                rz = roadz.RoadZ(d, None)
+                rz._fetch = lambda url, headers=None, lane=None: asked.append(url) or las_bytes(
+                    [(100, 200, 550, 2), (5000, 200, 900, 17)])
+                return rz
+            boxes = [(1000.0, 2000.0, 1070.0, 2010.0)]
+            a = provider()._read("USGS_X", ["1-0-0-0"], boxes, mapcells.CellKey(14, 4683, 6266))
+            b = provider()._read("USGS_X", ["1-0-0-0"], boxes, mapcells.CellKey(14, 4684, 6266))
+            self.assertEqual(len(asked), 1)
+            np.testing.assert_array_equal(a[0], b[0])
+            np.testing.assert_array_equal(a[1], b[1])
+            kept = os.path.join(d, "roadz", "eptnodes", "USGS_X", "1-0-0-0.laz")
+            self.assertTrue(os.path.exists(kept))
+            self.assertEqual(os.listdir(os.path.dirname(kept)), ["1-0-0-0.laz"], "no lock, no tmp")
+            # a damaged copy: dropped, downloaded again next time
+            with open(kept, "wb") as fh:
+                fh.write(b"LASF")
+            with self.assertRaises(Exception):
+                provider()._read("USGS_X", ["1-0-0-0"], boxes, mapcells.CellKey(14, 4685, 6266))
+            self.assertFalse(os.path.exists(kept))
+            provider()._read("USGS_X", ["1-0-0-0"], boxes, mapcells.CellKey(14, 4685, 6266))
+            self.assertEqual(len(asked), 2)
+
+    def test_kept_nodes_capped(self):
+        """The kept nodes cut back to NODES_MB, the least recently read first."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            rz = roadz.RoadZ(d, None)
+            rz._fetch = lambda url, headers=None, lane=None: bytes(400)
+            for i, k in enumerate(("0-0-0-0", "1-0-0-0", "1-1-0-0")):
+                rz._node_kept("USGS_X", k)
+                os.utime(rz._node_path("USGS_X", k), (1000 + i, 1000 + i))
+            rz._node_kept("USGS_X", "0-0-0-0")                  # (read again: the most recent)
+            old = roadz.NODES_MB, roadz.NODES_TRIM_MB
+            roadz.NODES_MB, roadz.NODES_TRIM_MB = 0.001, 0      # (two nodes' room; a look at the next write)
+            try:
+                rz._node_kept("USGS_X", "1-1-1-0")
+            finally:
+                roadz.NODES_MB, roadz.NODES_TRIM_MB = old
+            self.assertEqual(sorted(os.listdir(os.path.join(d, "roadz", "eptnodes", "USGS_X"))),
+                             ["0-0-0-0.laz", "1-1-1-0.laz"])
 
     def test_a_cell_another_process_built_is_taken_from_disk(self):
         """Another process wrote the cell's file (and removed its parts) while this one read its nodes: the cell is

@@ -102,6 +102,17 @@ LIDAR_MAX_GRADE = 0.10
 LIDAR_DATASETS = 2          # the newest datasets tried at a place
 LIDAR_FETCH_THREADS = int(os.environ.get("BNGE_LIDAR_THREADS", "16"))     # node reads at once (the host's policy: 16)
 RAW_NODES_MB = 48            # nodes' .laz kept in memory per process (RoadZ._node_bytes; ~0.25 MB a node)
+# The nodes' .laz kept on disk too, for every process and run (<cache>/roadz/eptnodes/<dataset>/<node>.laz, RoadZ.
+# _node_kept), the least recently read dropped past NODES_MB. A bridge within CLIP_PAD_M of a cell is boxed whole
+# (_bridges), so neighbouring cells pick the same nodes (~300 m, across their border too), and their points are kept
+# per cell and boxes (_read's parts): the memory's copies (RAW_NODES_MB) are one process's and 48 MB, so the other
+# process (warm, block, road tiles) or a later visit downloaded the node again (cold caches, 2026-11-11: 14 of Hartford
+# CT's 128 MB were a URL already fetched, 32 of San Francisco's 112). 2 GB: ~8000 nodes, a cold city's 110-130 MB
+# about 15 times over (a Seattle first visit ~1.2 GB), so the places round the last ones; a built cell keeps its decks,
+# an older node is only read again for a neighbour built later.
+# (BNGE_, not BNE_: a cap changes no content, and BNE_ settings are part of the revisit cache's code key)
+NODES_MB = float(os.environ.get("BNGE_LIDAR_NODES_MB", "2048"))
+NODES_TRIM_MB = 64          # MB a process writes there between its looks at the folder's size (_trim)
 BOX_STEP_M = 40.0           # m of a bridge's line per box its nodes are picked by
 MASK_M = 8.0                # m, the cells of the boxes' mask the points are kept by
 DATUM_MIN_PTS = 50
@@ -555,8 +566,8 @@ def datum_fit(z_src, z_dem):
 
 
 class Ept:
-    """One 3DEP dataset's Entwine Point Tiles: its ept.json and hierarchy (kept on disk: they do not change), node
-    reads (not kept: the decks made from them are)."""
+    """One 3DEP dataset's Entwine Point Tiles: its ept.json and hierarchy (kept on disk: they do not change). Its
+    nodes' .laz are RoadZ's (_node_kept: NODES_MB of them kept)."""
 
     def __init__(self, name, fetch_json):
         self.name = name
@@ -649,6 +660,9 @@ class RoadZ:
         self._raw = OrderedDict()           # (dataset, node) -> its .laz bytes (_node_bytes; RAW_NODES_MB kept)
         self._raw_bytes = 0
         self._raw_flight = {}               # (dataset, node) -> threading.Event of the read under way
+        # (the host's bytes, whatever VERSION: not under v<VERSION>; _node_kept)
+        self._nodes = os.path.join(cache_dir, "roadz", "eptnodes") if cache_dir else None
+        self._nodes_wrote = None            # MB this process wrote there since its last _trim (None: none yet)
         self._pool = None                   # the node reads' FIFO pool (_node_pool)
         self.enabled = ON                   # (the probes measure with it on whatever BNE_ROADZ says)
         self.lidar = LIDAR_ON
@@ -772,9 +786,9 @@ class RoadZ:
             ev.wait(60.0)
             with self._lock:
                 if key not in self._raw and self._raw_flight.get(key) is ev:
-                    return self._fetch(f"{EPT_BASE}{name}/ept-data/{k}.laz")    # (the reader hangs: our own read)
+                    return self._node_kept(name, k)     # (the reader hangs: our own read)
         try:
-            body = self._fetch(f"{EPT_BASE}{name}/ept-data/{k}.laz")
+            body = self._node_kept(name, k)
             with self._lock:
                 self._raw[key] = body
                 self._raw_bytes += len(body)
@@ -786,6 +800,85 @@ class RoadZ:
             with self._lock:
                 self._raw_flight.pop(key, None)
             ev.set()
+
+    def _node_path(self, name, k):
+        return os.path.join(self._nodes, name.replace("/", "_"), f"{k}.laz") if self._nodes else None
+
+    def _node_kept(self, name, k):
+        """Node k's .laz of dataset name: the disk copy (NODES_MB), or downloaded by one of the server's processes (its
+        claim a lock file beside the copy, waited for as a part's, _await_part: not xproc.once, whose job cancel check
+        would raise in a teleport's abandoned block) and kept. The bytes are the host's whoever reads them: the points
+        and their filtering are _read's, the same as from a fresh download."""
+        url = f"{EPT_BASE}{name}/ept-data/{k}.laz"
+        p = self._node_path(name, k)
+        if p is None:
+            return self._fetch(url)
+
+        def kept():
+            try:
+                with open(p, "rb") as fh:
+                    body = fh.read()
+            except OSError:
+                return None
+            with contextlib.suppress(OSError):
+                os.utime(p)                     # (its last read: _trim drops the least recently read first)
+            return body
+        body = kept()
+        if body is not None:
+            return body
+        mine = False
+        if PART_CLAIMS:
+            got, mine = _await_part(p + ".lock", p)
+            if got is not None and (body := kept()) is not None:
+                return body
+        try:
+            body = self._fetch(url)
+            try:
+                import staging
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                tmp = f"{p}.{os.getpid()}.{threading.get_ident()}.tmp"
+                with open(tmp, "wb") as fh:
+                    fh.write(body)
+                staging.replace_cached(tmp, p)
+            except Exception as e:
+                log.debug("roadz node write %s: %s", p, e)
+        finally:
+            if mine:
+                xproc.release(p + ".lock")
+        with self._lock:
+            due = self._nodes_wrote is None or self._nodes_wrote > NODES_TRIM_MB
+            self._nodes_wrote = 0 if due else self._nodes_wrote + len(body) / 1e6
+        if due:
+            self._trim()
+        return body
+
+    def _node_forget(self, name, k):
+        """Node k's kept copies (memory, disk) dropped: its bytes did not decode (downloaded again when asked again)."""
+        with self._lock:
+            old = self._raw.pop((name, k), None)
+            if old is not None:
+                self._raw_bytes -= len(old)
+        p = self._node_path(name, k)
+        if p:
+            with contextlib.suppress(OSError):
+                os.remove(p)
+
+    def _trim(self):
+        """The kept nodes cut back to NODES_MB, the least recently read first (as hklidar.Sheets.trim)."""
+        files = []
+        for dp, _dn, fns in os.walk(self._nodes):
+            for fn in fns:
+                if fn.endswith(".laz"):
+                    with contextlib.suppress(OSError):
+                        st = os.stat(os.path.join(dp, fn))
+                        files.append((st.st_mtime, st.st_size, os.path.join(dp, fn)))
+        total = sum(f[1] for f in files)
+        for _t, size, path in sorted(files):
+            if total <= NODES_MB * 1e6:
+                break
+            with contextlib.suppress(OSError):
+                os.remove(path)
+                total -= size
 
     def _node_pool(self):
         """The process's pool of node reads (LIDAR_FETCH_THREADS), first asked first read: each cell's read had a pool
@@ -1087,7 +1180,11 @@ class RoadZ:
                     xproc.release(lock)
 
         def fetch(k, pp):
-            p, c = fast._ef.las_decode(self._node_bytes(name, k), bb)
+            try:
+                p, c = fast._ef.las_decode(self._node_bytes(name, k), bb)
+            except Exception:
+                self._node_forget(name, k)      # (a damaged copy is not read again at every visit)
+                raise
             if len(p):
                 keep = mask[((p[:, 1] - bb[1]) // MASK_M).astype(int).clip(0, ny - 1),
                             ((p[:, 0] - bb[0]) // MASK_M).astype(int).clip(0, nx - 1)]
