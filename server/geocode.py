@@ -209,13 +209,13 @@ def wikidata_search_url(q, lang):
         "format": "json"})
 
 
-# The search's items' places: GeoData's primary coordinate of each (P625's best statement), ~0.2 KB. It replaced
+# The search's items' places: GeoData's coordinates of each (its P625 statements, in their order), ~0.2-1 KB. It replaced
 # wbgetentities' claims, which carry every statement of an item to read one: 0.1-2 MB for six hits ("Berlin" 0.55 MB,
 # six large cities 2 MB), on every search as the player types. The names and descriptions come with the search's own
 # answer (wbsearchentities: in the language asked, through its fallbacks to English).
 def wikidata_coords_url(ids):
     return WIKIDATA_URL + "?" + urllib.parse.urlencode({
-        "action": "query", "prop": "coordinates", "titles": "|".join(ids), "coprimary": "primary", "colimit": "max",
+        "action": "query", "prop": "coordinates", "titles": "|".join(ids), "coprimary": "all", "colimit": "max",
         "format": "json", "formatversion": 2})
 
 
@@ -225,7 +225,7 @@ def parse_wikidata(found, coords):
     pages = {p.get("title"): p for p in ((coords or {}).get("query") or {}).get("pages") or []}
     out = []
     for rank, x in enumerate((x for x in found if x.get("id")), 1):
-        c = ((pages.get(str(x["id"])) or {}).get("coordinates") or [None])[0]
+        c = _main_coordinate((pages.get(str(x["id"])) or {}).get("coordinates"))
         if not c or c.get("globe", "earth") != "earth" or not x.get("label"):
             continue
         try:
@@ -235,6 +235,13 @@ def parse_wikidata(found, coords):
         out.append({"name": x["label"], "detail": x.get("description") or "", "kind": "wikidata",
                     "lat": round(lat, 6), "lon": round(lon, 6), "rank": rank})
     return out
+
+
+def _main_coordinate(cs):
+    """An item's place: its primary coordinate (P625's preferred or only statement), else its first. A river or a
+    range has several (source, mouth, parts) and none primary: coprimary=primary left those out of the search."""
+    cs = cs or [None]
+    return next((c for c in cs if c and c.get("primary")), cs[0])
 
 
 def nominatim_url(q, lat=None, lon=None, limit=LIMIT, lang="en", near=False):

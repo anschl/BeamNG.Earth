@@ -173,6 +173,17 @@ class SourcesTest(unittest.TestCase):
         r = geocode.parse_wikidata(found, coords)
         self.assertEqual([(x["name"], x["detail"], x["rank"]) for x in r], [("a", "da", 1), ("b", "", 2)])
 
+    def test_wikidata_item_with_several_coordinates(self):
+        """A river (source and mouth, none primary): its first; a preferred statement (primary) wins over the order."""
+        found = [{"id": "Q1653", "label": "Danube"}, {"id": "Q1497", "label": "Mississippi River"}]
+        coords = {"query": {"pages": [
+            {"title": "Q1653", "coordinates": [{"lat": 45.2, "lon": 29.7, "primary": False, "globe": "earth"},
+                                               {"lat": 48.1, "lon": 8.2, "primary": False, "globe": "earth"}]},
+            {"title": "Q1497", "coordinates": [{"lat": 47.2, "lon": -95.2, "primary": False, "globe": "earth"},
+                                               {"lat": 29.2, "lon": -89.3, "primary": True, "globe": "earth"}]}]}}
+        self.assertEqual([(x["name"], x["lat"]) for x in geocode.parse_wikidata(found, coords)],
+                         [("Danube", 45.2), ("Mississippi River", 29.2)])
+
     def test_wikidata_asks_only_the_coordinates_of_the_hits(self):
         net = Answers({"wbsearchentities": json.dumps({"search": [{"id": "Q378688", "label": "Ganterbrücke"}]}).encode(),
                        "prop=coordinates": json.dumps({"query": {"pages": [{"title": "Q378688", "coordinates": [
@@ -180,7 +191,7 @@ class SourcesTest(unittest.TestCase):
         self.assertEqual([(r["name"], r["lat"]) for r in geocode._wikidata(net, "Ganterbrücke", "de")],
                          [("Ganterbrücke", 46.296372)])
         q = parse_qs(urlparse(net.urls[-1]).query)
-        self.assertEqual((q["titles"], q["coprimary"]), (["Q378688"], ["primary"]))
+        self.assertEqual((q["titles"], q["coprimary"]), (["Q378688"], ["all"]))
         self.assertFalse([u for u in net.urls if "wbgetentities" in u])
 
     def test_nominatim_labels(self):
