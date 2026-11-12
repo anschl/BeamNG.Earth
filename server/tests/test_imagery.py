@@ -499,6 +499,69 @@ class ChainTest(unittest.TestCase):
         self.assertIs(out[0], out[1])
         self.assertEqual(len(im.requests), 1)
 
+    def test_urgent_waits_for_the_same_tile_on_the_wire(self):
+        """An urgent render that meets a prefetch of its tile downloading waits for it (one request, not two on the
+        urgent threads)."""
+        gate, asked = threading.Event(), threading.Event()
+
+        def serve(name, z, x, y):
+            asked.set()
+            gate.wait(5)
+            return self.tile(name, z, x, y)
+        im = FakeNet(self.tmp.name, serve, chain=("eox2023",), tone=0.0)
+        key = (imagery.SOURCES["eox2023"], 14, 100, 200)
+        with im._lock:
+            im._future(key, "prefetch")
+        self.assertTrue(asked.wait(5))
+        out = []
+
+        def urgent():
+            with im.urgent():
+                out.append(im.tiles([key])[key])
+        t = threading.Thread(target=urgent)
+        t.start()
+        time.sleep(0.2)
+        gate.set()
+        t.join(5)
+        self.assertTrue(out and out[0] is not None)
+        self.assertEqual(len(im.requests), 1)
+
+    def test_fetch_later_source_by_source(self):
+        """A quick texture's background download (the 3D map) asks EOX 2023 only under the cells USGS leaves (before:
+        every source's tiles at once), and the quick render after it is the full render's texture."""
+        f = g.EnuFrame(LAT0, LON0)
+        for holes in (False, True):
+            for gutter in (False, True):
+                with self.subTest(holes=holes, gutter=gutter), tempfile.TemporaryDirectory() as d, \
+                        tempfile.TemporaryDirectory() as d_ref:
+                    def serve(name, z, x, y):
+                        if name == "usgs" and z == 15 and holes and x % 3 == 0:
+                            return 404, b""
+                        return self.tile(name, z, x, y)
+                    sq = (-2048.0, -2048.0, 4096.0)       # 4 m texels: USGS z15, EOX z14
+                    px = 1024
+                    if gutter:
+                        sq = imagery.gutter_square(*sq, px)
+                    im = FakeNet(d, serve, tone=0.0)
+                    done = threading.Event()
+                    im.add_img_listener(lambda token, changed: done.set())
+                    self.assertEqual(len(im.fetch_later(f, *sq, px, gutter=gutter)), 1)
+                    self.assertTrue(done.wait(10))
+                    eox = {r[2:] for r in im.requests if r[0] == "eox2023"}
+                    self.assertEqual(bool(eox), holes, "EOX only under USGS's holes")
+                    self.assertEqual(im.fetch_later(f, *sq, px, gutter=gutter), [], "nothing more to fetch")
+                    n = len(im.requests)
+                    with im.quick():
+                        rgb, used = im.render(f, *sq, px, gutter=gutter)
+                    self.assertFalse([r for r in im.requests[n:] if r[0] != "eox2016"])
+                    ref = FakeNet(d_ref, serve, tone=0.0)
+                    rgb_ref, used_ref = ref.render(f, *sq, px, gutter=gutter)
+                    np.testing.assert_array_equal(rgb, rgb_ref)
+                    self.assertEqual(used, used_ref)
+                    self.assertLessEqual({r[2:] for r in ref.requests if r[0] == "eox2023"}, eox)
+                    every = next(keys for _, s, _, keys, _ in im._needed(f, *sq, px, gutter) if s.name == "eox2023")
+                    self.assertLess(len(eox), len(every), "before: all of them")
+
     @staticmethod
     def idle(im, timeout=5.0):
         t0 = time.monotonic()
@@ -620,7 +683,7 @@ class ExportImageryTest(unittest.TestCase):
     def child_colour(x, y):
         return (50 + x % 7 * 20, 60 + y % 5 * 30, 210)
 
-    def make(self, black=False):
+    def make(self, black=False, chain=("naip", "usgs"), serve_xyz=None, cache_dir=None):
         def serve_export(z, x, y, size):
             n = size // 256
             a = np.zeros((size, size, 3), np.uint8)
@@ -634,14 +697,14 @@ class ExportImageryTest(unittest.TestCase):
             Image.fromarray(a).save(b, "JPEG", quality=95)
             return 200, b.getvalue()
 
-        def serve_xyz(name, z, x, y):
+        def red(name, z, x, y):
             a = np.zeros((256, 256, 3), np.uint8) + np.array((200, 30, 30), np.uint8)
             a[::2, ::2] += 6
             return 200, png(a)
         self.requests = []
-        net = netfetch.Fetcher(transport=ExportTransport(serve_export, serve_xyz, self.requests),
+        net = netfetch.Fetcher(transport=ExportTransport(serve_export, serve_xyz or red, self.requests),
                                sleep=lambda s: None, policies=FAST)
-        return imagery.Imagery(self.tmp.name, ("naip", "usgs"), fetcher=net, tone=0.0)
+        return imagery.Imagery(cache_dir or self.tmp.name, chain, fetcher=net, tone=0.0)
 
     def wait(self, im):
         for _ in range(200):
@@ -682,6 +745,68 @@ class ExportImageryTest(unittest.TestCase):
         im.disk.read = lambda path: reads.append(path) or orig(path)
         time.sleep(0.3)
         self.assertEqual(reads, [], "the warm thread rests")
+
+    def test_warm_skips_naip_under_a_full_tile_cache(self):
+        """A regional tile cache ahead of NAIP (Virginia's here) whose tiles on disk fill a block whole: no NAIP export
+        for it (cold Hartford: 160 of them where Connecticut's cache covered). A block with a blank tile of the cache in
+        it or round it still gets one, and the texture is the one NAIP warmed everywhere gave."""
+        chain = ("virginia", "naipusda", "usgs")
+        vs = imagery.SOURCES["virginia"]
+        lat, lon, _ = self.frame.enu_to_geodetic(0.0, 0.0, 0.0)
+        fx, fy = imagery.mercator_px(float(lat), float(lon), 17)
+        blank = (int(fx) // imagery.TILE, int(fy) // imagery.TILE)     # (the cache's tile under the origin)
+
+        def serve_xyz(name, z, x, y):
+            if name == "virginia" and (z, x, y) == (17, *blank):
+                return 200, png(np.full((256, 256, 3), 255, np.uint8))
+            return 200, png(background(z, x, y))
+
+        def warmed(cache_dir, skip):
+            im = self.make(chain=chain, serve_xyz=serve_xyz, cache_dir=cache_dir)
+            if not skip:
+                im._filled_before = lambda *a: False            # (as before)
+            keys = im.route_keys(lat, lon, 300.0, 1.0)
+            im.tiles({(vs, 17, x, y) for _, _, bx, by in keys for x in range(bx - 1, bx + 5)
+                      for y in range(by - 1, by + 5)})          # (the renders' tiles of the cache on disk)
+            self.assertEqual(self.warm(im, [(0.0, 0.0)]), [])
+            return im, keys, {r[2:] for r in self.requests if r[0] == "naipusda"}
+        with tempfile.TemporaryDirectory() as d:
+            ref, _, naip_ref = warmed(d, False)
+            rgb_ref, used_ref = ref.render(self.frame, -512.0, -512.0, 1024.0, 1024)
+        im, keys, naip = warmed(None, True)
+        want = {(bx >> 2, by >> 2) for _, _, bx, by in keys
+                if bx - 1 <= blank[0] <= bx + 4 and by - 1 <= blank[1] <= by + 4}
+        self.assertEqual(naip, want)
+        self.assertLess(len(naip), len(naip_ref))
+        self.assertTrue(im.lazy_ready(self.frame, -512.0, -512.0, 1024.0, 1024))
+        rgb, used = im.render(self.frame, -512.0, -512.0, 1024.0, 1024)
+        self.assertIn("naipusda", used)                     # (the blank tile)
+        np.testing.assert_array_equal(rgb, rgb_ref)
+        self.assertEqual(used, used_ref)
+
+    def test_us_sources_never_asked_outside_the_us(self):
+        """Amsterdam: no USGS coverage probe, no NAIP export (a cold visit sent basemap.nationalmap.gov 50 requests, all
+        404, and NAIP exports before those had answered); the US's states and territories are still asked."""
+        frame = g.EnuFrame(52.37, 4.90)
+        im = self.make(chain=("naipusda", "usgs", "eox2023"))
+        im.prefetch(frame, 0.0, 0.0, 256.0, 256)
+        _, used = im.render(frame, 0.0, 0.0, 256.0, 256)
+        im.warm(frame, [(0.0, 0.0)], 300.0, 1.0)
+        self.assertEqual(im.sharp_zoom(52.37, 4.90), 14)
+        self.assertTrue(im.lazy_ready(frame, 0.0, 0.0, 256.0, 256))
+        self.wait(im)
+        self.assertEqual(set(used), {"eox2023"})
+        self.assertEqual({r[0] for r in self.requests}, {"eox2023"})
+
+        def key(name, lat, lon, z=12):
+            x, y = imagery.mercator_px(lat, lon, z)
+            return imagery.SOURCES[name], z, int(x) // imagery.TILE, int(y) // imagery.TILE
+        self.assertTrue(imagery.off_us(key("usgs", 52.37, 4.90)))
+        self.assertTrue(imagery.off_us(key("naip", 52.37, 4.90, 17)))
+        self.assertFalse(imagery.off_us(key("eox2023", 52.37, 4.90)))
+        for lat, lon in ((39.28, -76.59), (61.2, -149.9), (21.3, -157.8), (18.45, -66.1), (13.45, 144.75),
+                         (52.9, 173.2)):        # Baltimore, Anchorage, Honolulu, San Juan, Guam, Attu
+            self.assertFalse(imagery.off_us(key("usgs", lat, lon)), (lat, lon))
 
     def test_far_warm_fetches_a_far_squares_best_photos(self):
         # a far tile larger than its level's (farpvs.UP_ON): its NAIP photos after the near list, its callback once in

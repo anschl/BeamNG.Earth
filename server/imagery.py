@@ -357,13 +357,16 @@ def match_colours(rgb, ref, sigma_px):
 
 def in_bounds(src, z, x, y):
     """Tile (z, x, y) overlaps src.bounds (True when the source has none)."""
-    if not src.bounds:
-        return True
-    s, w, n, e = src.bounds
+    return not src.bounds or _box_overlaps(src.bounds, z, x, x, y, y)
+
+
+def _box_overlaps(box, z, tx0, tx1, ty0, ty1):
+    """Any tile of the range (z; tx0..tx1, ty0..ty1, inclusive) overlaps box (s, w, n, e degrees). Pure."""
+    s, w, n, e = box
     k = 2 ** z
-    lon0, lon1 = x / k * 360 - 180, (x + 1) / k * 360 - 180
-    lat1 = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / k))))
-    lat0 = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (y + 1) / k))))
+    lon0, lon1 = tx0 / k * 360 - 180, (tx1 + 1) / k * 360 - 180
+    lat1 = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * ty0 / k))))
+    lat0 = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (ty1 + 1) / k))))
     return lon1 > w and lon0 < e and lat1 > s and lat0 < n
 
 
@@ -371,18 +374,31 @@ def in_bounds(src, z, x, y):
 # credits their area is the US: (s, w, n, e), the lower 48 for NAIP, with Alaska and Hawaii for USGS
 US_CREDIT_BOXES = {"naip": (24.0, -125.0, 50.0, -66.0), "naipusda": (24.0, -125.0, 50.0, -66.0),
                    "usgs": (18.0, -180.0, 72.0, -65.0)}
+# ... and where they may have data at all (s, w, n, e; generous: the states, Alaska with the Aleutians past the
+# antimeridian, Hawaii, Puerto Rico and the Virgin Islands, Guam and the Marianas, American Samoa): a tile of theirs
+# wholly outside these is missing without a request, its coverage probes are not asked (off_us). A cold Amsterdam
+# visit (2026-11-11) sent basemap.nationalmap.gov 50 probe requests, all 404 (kept 90 days, then asked again), and the
+# warm thread NAIP exports before those probes had answered. Not Source.bounds: that ends _needed's walk early.
+US_DATA_BOXES = ((17.0, -180.0, 72.0, -64.0), (51.0, 172.0, 54.0, 180.0), (13.0, 144.0, 21.0, 147.0),
+                 (-15.0, -171.5, -11.0, -168.0))
+
+
+def off_us(key):
+    """A US federal source's tile (USGS, NAIP, or one probed through those) wholly outside US_DATA_BOXES. Pure."""
+    src, z, x, y = key
+    if src.name not in US_CREDIT_BOXES and src.probe_source not in US_CREDIT_BOXES:
+        return False
+    return not any(_box_overlaps(b, z, x, x, y, y) for b in US_DATA_BOXES)
+
+
+def outside(key):
+    """A tile no source is asked for: outside its source's bounds, or a US source's outside the US. Pure."""
+    return not in_bounds(*key) or off_us(key)
 
 
 def range_in_bounds(src, z, tx0, tx1, ty0, ty1):
     """Any tile of the range (z; tx0..tx1, ty0..ty1, inclusive) overlaps src.bounds."""
-    if not src.bounds:
-        return True
-    s, w, n, e = src.bounds
-    k = 2 ** z
-    lon0, lon1 = tx0 / k * 360 - 180, (tx1 + 1) / k * 360 - 180
-    lat1 = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * ty0 / k))))
-    lat0 = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (ty1 + 1) / k))))
-    return lon1 > w and lon0 < e and lat1 > s and lat0 < n
+    return not src.bounds or _box_overlaps(src.bounds, z, tx0, tx1, ty0, ty1)
 
 
 def _under(pz, px, py, z):
@@ -468,6 +484,22 @@ def as_tile(rgb):
     return Tile(rgb, is_uniform(rgb))
 
 
+def _decode(data):
+    """A source tile's bytes as a Tile (256², RGB); raises OSError / ValueError when they are not an image."""
+    im = Image.open(io.BytesIO(data))
+    if im.mode in ("P", "LA", "RGBA"):     # EOX's ocean PNG: paletted with transparency
+        im = im.convert("RGBA")
+    im = im.convert("RGB")
+    if im.size != (TILE, TILE):
+        im = im.resize((TILE, TILE), Image.BILINEAR)
+    return as_tile(np.asarray(im))
+
+
+def _draws_whole(t):
+    """A source tile (not the chain's last) render draws in full: data, not uniform, no nodata hole. Pure."""
+    return isinstance(t, Tile) and not t.uniform and nodata_mask(t.rgb) is None
+
+
 QUICK_OVERZOOM = 4          # levels up a quick render looks for the same source's tile on disk (Imagery._quick_ancestor)
 
 
@@ -522,6 +554,7 @@ DS_PENDING = "ds"
 # pending token (IMG_PENDING, batch id) until their background download is done (fetch_later, img_status)
 IMG_PENDING = "img"
 LATER_WORKERS = 6           # fetch_later's batches downloading at once
+_ON_DISK = "on disk"        # (Imagery._known: a tile's file is there, not decoded)
 
 
 class Imagery:
@@ -578,6 +611,8 @@ class Imagery:
         self._fin_sigs = {}                 # source name -> its finished tiles' settings hash (_fin_sig)
         self._lru = OrderedDict()           # (source, z, x, y) -> Tile, or None (404)
         self._export_locks = {}             # export parent -> its fetch lock (_download_export)
+        self._downloads = {}                # plain tile's path -> (Event, kind) of its download in flight (_claim)
+        self._full_blocks = {}              # (_filled_before) (source, z, x, y, export) -> its tiles on disk fill it
         self._warm_want = []                # warm(): lazy tiles ahead of the player, nearest first
         self._warm_cv = threading.Condition()
         self._warm_thread = None
@@ -656,9 +691,46 @@ class Imagery:
         if src.pack:
             return self._download_pack(src, z, x, y)
         url = src.url.format(z=z, x=x, y=y, ty=(1 << z) - 1 - y)     # {ty}: a TMS cache's flipped row
-        if self.fetcher.miss_alive(miss, url):
-            return None
         kind = getattr(self._local, "kind", "demand")
+        while True:
+            if self.fetcher.miss_alive(miss, url):
+                return None
+            busy = self._claim(path, kind)
+            if not busy:
+                break
+            busy.wait()                         # the same tile on the wire in another thread: its file, or its miss
+            data = self.disk.read(path)
+            if data is not None:
+                self._count(src.name + ":disk")
+                return data
+        try:
+            return self._fetch_xyz(src, url, path, miss, kind)
+        finally:
+            if busy is None:
+                self._unclaim(path)
+
+    def _claim(self, path, kind):
+        """One download of a plain tile at a time (export and pack sources have their parent's lock): None, this thread
+        downloads it (_unclaim after); the Event of the download in flight to wait for; False, an urgent request that
+        downloads beside a demand one (which may queue for the host's slots and tokens: netfetch keeps some for urgent;
+        the other kinds never queue there). Before (2026-11-12) an urgent render that met a prefetch of the same tile
+        fetched it a second time on the urgent threads (Imagery._future), and two kinds' fetches of one tile could
+        overlap anywhere."""
+        with self._lock:
+            got = self._downloads.get(path)
+            if got is None:
+                self._downloads[path] = (threading.Event(), kind)
+                return None
+            return False if kind == "urgent" and got[1] == "demand" else got[0]
+
+    def _unclaim(self, path):
+        with self._lock:
+            got = self._downloads.pop(path, None)
+        if got is not None:
+            got[0].set()
+
+    def _fetch_xyz(self, src, url, path, miss, kind):
+        """A plain tile's request, its bytes written to path; None for a 404 (remembered at miss)."""
         try:
             r = self.fetcher.get(url, kind=kind)
         except netfetch.NotFound:               # outside the source's coverage
@@ -885,7 +957,8 @@ class Imagery:
             x0, x1, y0, y1 = _under(pz, px, py, z)
             if not range_in_bounds(src, z, x0, x1, y0, y1):
                 continue
-            keys = [(src, z, x, y) for y in range(y0, y1 + 1) for x in range(x0, x1 + 1) if in_bounds(src, z, x, y)]
+            keys = [(src, z, x, y) for y in range(y0, y1 + 1) for x in range(x0, x1 + 1)
+                    if not outside((src, z, x, y))]
             if not keys:
                 continue
             probe = self._probe_key(keys[0])
@@ -975,16 +1048,10 @@ class Imagery:
         if data is None:
             return None
         try:
-            im = Image.open(io.BytesIO(data))
-            if im.mode in ("P", "LA", "RGBA"):     # EOX's ocean PNG: paletted with transparency
-                im = im.convert("RGBA")
-            im = im.convert("RGB")
+            return _decode(data)
         except (OSError, ValueError) as e:     # not an image (an error page served as 200?)
             self._discard(src, z, x, y)
             raise ImageryError(f"undecodable {src.name} tile {z}/{x}/{y}: {e}") from None
-        if im.size != (TILE, TILE):
-            im = im.resize((TILE, TILE), Image.BILINEAR)
-        return as_tile(np.asarray(im))
 
     @staticmethod
     def _probe_key(key):
@@ -1004,7 +1071,7 @@ class Imagery:
         """'covered' / 'outside' / 'unknown' from the key's coverage probes, coarsest first;
         starts the fetch of the first unknown one. Caller holds the lock."""
         src, z, x, y = key
-        if not in_bounds(*key):
+        if outside(key):
             return "outside"                # (never ask a source about a place outside its area)
         psrc = SOURCES[src.probe_source] if src.probe_source else src
         for pz in sorted(p for p in src.probe_zooms if p < z):
@@ -1063,7 +1130,7 @@ class Imagery:
         # (quick, the 3D map: a source before the chain's last only from disk, fetch_later downloads the rest)
         quick = self.quick_all or getattr(self._caller, "quick", False)
         last = self.chain[-1] if self.chain else None
-        probes = {k: self._probe_key(k) for k in keys}
+        probes = {k: None if outside(k) else self._probe_key(k) for k in keys}
         known = self.tiles({p for p in probes.values() if p is not None}, kind) if any(probes.values()) else {}
         out, futs, over = {}, {}, {}
         with self._lock:
@@ -1073,7 +1140,7 @@ class Imagery:
                 elif k in self._lru:
                     self._lru.move_to_end(k)
                     out[k] = self._lru[k]
-                elif not in_bounds(*k):
+                elif outside(k):
                     out[k] = None                   # outside the source's area
                 elif (k[0].lazy or (quick and k[0] is not last)) and not self._on_disk(k):
                     anc = self._quick_ancestor(k) if quick and not k[0].lazy else None
@@ -1121,9 +1188,10 @@ class Imagery:
 
     def _needed(self, frame, x0, y0, size, px, gutter=False):
         """The source tiles render(frame, x0, y0, size, px, gutter=gutter) may need, source by source in chain order:
-        (k, src, host, [keys]); nothing past the poles, a mosaic over MAX_MOSAIC, or a source's area ending the chain (as
-        render fails over). With `gutter` (a far texture: x0, y0, size its gutter_square) only the footprint's own tiles
-        (render takes the gutter's from what is on hand)."""
+        (k, src, host, [keys], (fx, fy): the global pixel coordinates of the render cells' corners at the keys' zoom);
+        nothing past the poles, a mosaic over MAX_MOSAIC, or a source's area ending the chain (as render fails over).
+        With `gutter` (a far texture: x0, y0, size its gutter_square) only the footprint's own tiles (render takes the
+        gutter's from what is on hand)."""
         where = self.square(frame, x0, y0, size, px, gutter)
         cells = min(MESH_CELLS, px)
         cw = px // cells
@@ -1161,7 +1229,7 @@ class Imagery:
             if g:
                 cx0, cx1, cy0, cy1 = _core_tiles(fx, fy, cells, cw, g, px)
                 keys = {t: kk for t, kk in keys.items() if cx0 <= t[0] <= cx1 and cy0 <= t[1] <= cy1}
-            yield k, src, netfetch.host_of(src.url), list(keys.values())
+            yield k, src, netfetch.host_of(src.url), list(keys.values()), (fx, fy)
 
     def _missing(self, k, key):
         """Is key's tile known to be missing (404, or uniform where a later source can fill it)? None: not known."""
@@ -1180,7 +1248,7 @@ class Imagery:
         moments, not a guess: a host that takes no prefetch now still gets them, as demand (with a host past 80 %
         of its daily budget the far field fetched only its 2 tiles in flight at a time: a Deck's took 231 s, GitHub
         #116)."""
-        for k, src, host, keys in self._needed(frame, x0, y0, size, px, gutter):
+        for k, src, host, keys, _ in self._needed(frame, x0, y0, size, px, gutter):
             if not self.fetcher.available(host):
                 continue                    # circuit open: render fails over to the next source, warm that
             # --colormatch: their regions' seams, in the background (not under the lock: it may read a
@@ -1243,15 +1311,14 @@ class Imagery:
 
     def fetch_later(self, frame, x0, y0, size, px, gutter=False):
         """The tiles a quick render of render(frame, x0, y0, size, px) leaves out (the sources before the chain's
-        last, not on disk; not the lazy ones, warm() fetches those) downloaded in the background, together:
+        last, not on disk; not the lazy ones, warm() fetches those) downloaded in the background, source by source as
+        render fails over (_later_walk: a source only under the cells the ones before it do not fill):
         [(IMG_PENDING, batch id)] for the texture's pending set (its live re-render once done: earthd far_retex), or
-        [] when nothing is missing."""
-        missing = []
-        for k, src, host, keys in self._needed(frame, x0, y0, size, px, gutter):
-            if k >= len(self.chain) - 1 or src.lazy:
-                continue
-            missing += [key for key in keys if in_bounds(*key) and not self._on_disk(key)]
-        if not missing:
+        [] when nothing is missing (as memory and the disk tell: _known)."""
+        steps = [s for s in self._needed(frame, x0, y0, size, px, gutter)
+                 if s[0] < len(self.chain) - 1 and not s[1].lazy]
+        cells, edge = min(MESH_CELLS, px), gutter and not GUTTER_FETCH
+        if not self._later_walk(steps, cells, edge, self._known):
             return []
         with self._lock:
             self._later_seq += 1
@@ -1266,8 +1333,8 @@ class Imagery:
 
         def run():
             try:
-                self.tiles(missing, kind="background")
-            except Exception as e:      # (a host down: the texture stays as it is; asked again when sent again)
+                self._later_walk(steps, cells, edge, lambda keys: self.tiles(keys, kind="background"))
+            except Exception as e:      # (the texture stays as it is; asked again when sent again)
                 log.debug("fetch_later: %s: %s", type(e).__name__, e)
             self._later[bid] = True
             for fn in list(self._img_listeners):
@@ -1278,13 +1345,65 @@ class Imagery:
         self._later_pool.submit(run)
         return [token]
 
+    def _later_walk(self, steps, cells, edge, look):
+        """fetch_later's walk (steps: _needed's, the sources before the chain's last, not lazy), as render fails over:
+        each source asked only for its tiles under the render cells the earlier ones do not fill for sure, through
+        look(keys) -> {key: Tile, None (no data there) or _ON_DISK (there, not decoded: fills nothing for sure)}, a key
+        it leaves out not known (a failed look: none known). A cell is filled when every earlier source's tile under it
+        (_cell_tiles) is drawn whole (_draws_whole). The walk ends where render's does: the whole square filled, or with
+        a gutter (`edge`) the footprint, a cell then counting only the footprint's tiles; a source render goes on to is
+        asked for the gutter's cells too (it fills them there). Returns the keys left out (to fetch). Every source's tiles were fetched together before: EOX 2023's
+        under ground USGS or the Sentinel-2 packs already filled (EOX is the host whose budget the 3D map runs into)."""
+        foot = np.zeros((cells, cells), bool)       # cells an earlier source fills: the footprint's texels in them
+        whole = np.zeros((cells, cells), bool)      # ... all their texels
+        unknown = []
+        for k, src, host, keys, (fx, fy) in steps:
+            n = 1 << keys[0][1]
+            mine = {kk[2:] for kk in keys}
+            under = {rc: {(tx % n, ty) for tx, ty in _cell_tiles(fx, fy, *rc)} for rc in zip(*np.nonzero(~whole))}
+            need = set().union(*under.values())
+            ask = [kk for kk in keys if kk[2:] in need and not outside(kk)]
+            try:
+                got = look(ask) if ask else {}
+            except ImageryError:
+                got = {}
+            unknown += [kk for kk in ask if kk not in got]
+            good = {kk[2:] for kk, t in got.items() if _draws_whole(t)}
+            for (r, c), ts in under.items():
+                foot[r, c] |= (ts & mine) <= good
+                whole[r, c] = ts <= good
+            if (foot if edge else whole).all():
+                break
+        return unknown
+
+    def _known(self, keys):
+        """fetch_later's look before its batch, reading no file: {key: Tile or None} of the keys in memory (a coverage
+        probe in memory that says no data: None), _ON_DISK for a file on disk, None for a remembered 404."""
+        out = {}
+        with self._lock:
+            for k in keys:
+                if k in self._lru:
+                    out[k] = self._lru[k]
+                    continue
+                p = self._probe_key(k)
+                if p is not None and p in self._lru and not self._covered(self._lru[p]):
+                    out[k] = None
+        for k in keys:
+            if k not in out:
+                jpg, miss = self._paths(*k)
+                if os.path.exists(jpg):
+                    out[k] = _ON_DISK
+                elif missindex.known(miss):
+                    out[k] = None
+        return out
+
     def fetch_needed(self, frame, x0, y0, size, px, last_only=False, gutter=False):
         """Fetch (on demand, waiting) the source tiles render(frame, x0, y0, size, px) needs: the first source of the
         chain, the next where every tile of the previous is missing. For a far-tile worker that met a tile not on
         disk (its prefetch was dropped: a host at its budget, GitHub #116, or a fast drive): the tiles come here,
         the render goes back to the worker processes (one main-process render held the far field on a Deck).
         True when the tiles are there (or known to be missing); False on a fetch error."""
-        for k, src, host, keys in self._needed(frame, x0, y0, size, px, gutter):
+        for k, src, host, keys, _ in self._needed(frame, x0, y0, size, px, gutter):
             if not self.fetcher.available(host) or (last_only and k < len(self.chain) - 1):
                 continue
             try:
@@ -1341,7 +1460,7 @@ class Imagery:
                 for ty in range(int((fy[0] - r_px) // TILE), int((fy[0] + r_px) // TILE) + 1):
                     for tx in range(int((fx[0] - r_px) // TILE), int((fx[0] + r_px) // TILE) + 1):
                         key = (src, z, (tx >> k) << k, (ty >> k) << k)   # one child per parent
-                        if key not in seen and in_bounds(*key):
+                        if key not in seen and not outside(key):
                             seen.add(key)
                             want.append(key)
         return want
@@ -1417,7 +1536,7 @@ class Imagery:
             for ty in range(int(fy.min() // TILE) >> k << k, int(fy.max() // TILE) + 1, 1 << k):
                 for tx in range(int(fx.min() // TILE) >> k << k, int(fx.max() // TILE) + 1, 1 << k):
                     key = (src, z, tx, ty)
-                    if in_bounds(*key):
+                    if not outside(key):
                         want.append(key)
         return want
 
@@ -1512,8 +1631,8 @@ class Imagery:
     def _warm_done(self, key):
         """Nothing (more) to fetch for key's parent: it was fetched (its last child, the one written last, is
         on disk or known to be missing), an earlier lazy source of the chain has data there (its last
-        child is on disk: this one is only the fallback where that one is black), or the area is outside
-        the coverage probes."""
+        child is on disk: this one is only the fallback where that one is black), an earlier tile cache's tiles on
+        disk fill it (_filled_before), or the area is outside the coverage probes."""
         src, z, x, y = key
         last = (1 << src.export) - 1
         for s in self.chain:
@@ -1522,10 +1641,53 @@ class Imagery:
             if s.lazy and s.export == src.export and os.path.exists(self._paths(s, z, x | last, y | last)[0]):
                 return True
         path, miss = self._paths(src, z, x | last, y | last)
-        if os.path.exists(path) or missindex.known(miss):
+        if os.path.exists(path) or missindex.known(miss) or self._filled_before(src, z, x, y):
             return True
         with self._lock:
             return self._probe_status(key) == "outside"
+
+    def _filled_before(self, src, z, x, y):
+        """Do an earlier non-lazy source's tiles on disk (a regional tile cache: Connecticut's, Ohio's ...) fill the
+        export block of lazy src's tile (z, x, y) whole, so render never draws src there: one source's zoom-z tiles
+        under the block and the ring round it (the block's edge texels' bilinear taps) all on disk and drawn whole
+        (_draws_whole). Decided once per block when they are all there; no request. A cold Hartford visit
+        (2026-11-12) sent apps.geo.fpac.usda.gov 160 NAIP exports (30 MB) for ground cteco.uconn.edu covered; at the
+        cache's edge, where its tiles are blank or missing, the block is fetched as before."""
+        k = src.export
+        x0, y0, side = (x >> k) << k, (y >> k) << k, 1 << k
+        n = 1 << z
+        for s in self.chain:
+            if s is src:
+                return False
+            if s.lazy or not s.min_zoom <= z <= min(s.max_zoom, s.max_view_zoom) or \
+                    not range_in_bounds(s, z, x0, x0 + side - 1, y0, y0 + side - 1):
+                continue
+            ck = (s.name, z, x0, y0, k)
+            full = self._full_blocks.get(ck)
+            if full is None:
+                keys = [(s, z, tx % n, ty) for ty in range(y0 - 1, y0 + side + 1)
+                        for tx in range(x0 - 1, x0 + side + 1)]
+                if not all(0 <= kk[3] < n and not outside(kk) and self._on_disk(kk) for kk in keys):
+                    continue                # (not all fetched yet: no verdict)
+                full = all(_draws_whole(self._disk_tile(kk)) for kk in keys)
+                if len(self._full_blocks) > 100000:
+                    self._full_blocks.clear()
+                self._full_blocks[ck] = full
+            if full:
+                return True
+        return False
+
+    def _disk_tile(self, key):
+        """A source tile from memory or its file (decoded, not kept), never the network; None when neither has it."""
+        with self._lock:
+            t = self._lru.get(key, False)
+        if t is not False:
+            return t
+        data = self.disk.read(self._paths(*key)[0])
+        try:
+            return None if data is None else _decode(data)
+        except (OSError, ValueError):
+            return None
 
     def lazy_ready(self, frame, x0, y0, size, px):
         """True when render(frame, x0, y0, size, px) would find every lazy-source tile it can use on disk
@@ -1548,10 +1710,10 @@ class Imagery:
         for ty in range(int(math.floor(fy.min() - 1)) // TILE, int(math.floor(fy.max() + 1)) // TILE + 1):
             for tx in range(int(math.floor(fx.min() - 1)) // TILE, int(math.floor(fx.max() + 1)) // TILE + 1):
                 for src in lazy:            # the first with data decides; a missing one passes to the next
-                    if not in_bounds(src, z, tx, ty):
+                    if outside((src, z, tx, ty)):
                         continue
                     path, miss = self._paths(src, z, tx, ty)
-                    if os.path.exists(path):
+                    if os.path.exists(path) or self._filled_before(src, z, tx, ty):    # (no lazy tile drawn there)
                         break
                     if missindex.known(miss):
                         continue
@@ -2107,11 +2269,16 @@ def _unfilled_tiles(filled, cells, cw, fx, fy):
             c1 = px if c == cells - 1 else (c + 1) * cw
             if filled[r * cw:r1, c * cw:c1].all():
                 continue
-            xs, ys = fx[r:r + 2, c:c + 2], fy[r:r + 2, c:c + 2]
-            for ty in range(int(math.floor(ys.min() - 1)) // TILE, int(math.floor(ys.max() + 1)) // TILE + 1):
-                for tx in range(int(math.floor(xs.min() - 1)) // TILE, int(math.floor(xs.max() + 1)) // TILE + 1):
-                    out.add((tx, ty))
+            out |= _cell_tiles(fx, fy, r, c)
     return out
+
+
+def _cell_tiles(fx, fy, r, c):
+    """{(tx, ty)} of the tiles (unwrapped, as _mosaic_keys) under render cell (r, c) with the bilinear taps' pixel
+    round it (fx, fy: global pixel coordinates at the grid corners). Pure."""
+    xs, ys = fx[r:r + 2, c:c + 2], fy[r:r + 2, c:c + 2]
+    return {(tx, ty) for ty in range(int(math.floor(ys.min() - 1)) // TILE, int(math.floor(ys.max() + 1)) // TILE + 1)
+            for tx in range(int(math.floor(xs.min() - 1)) // TILE, int(math.floor(xs.max() + 1)) // TILE + 1)}
 
 
 class MercSquare:
