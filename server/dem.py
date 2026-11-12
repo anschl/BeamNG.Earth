@@ -22,6 +22,7 @@ and expire after the host's miss_ttl (Mapterhorn 90 days: it adds lidar areas; A
 """
 from runtimeprofiler import step as profile_step
 import contextlib
+import hashlib
 import io
 import json
 import logging
@@ -154,6 +155,11 @@ def coverage_index(doc):
             except (KeyError, TypeError, ValueError):
                 continue
     return out
+
+
+def _digest(body):
+    """The file list's digest, kept with its ETag (Dem._coverage_fetch)."""
+    return hashlib.sha256(body).hexdigest()
 
 
 def _coverage_on_disk(path):
@@ -556,10 +562,13 @@ class Dem:
         headers = None
         try:
             with open(path, "rb") as f:
-                old = coverage_index(json.loads(f.read()))
+                body = f.read()
+            old = coverage_index(json.loads(body))
             with open(etag_path, encoding="utf-8") as f:
-                etag = f.read().strip()
-            if old and etag:                # (a copy that does not parse is not kept by a 304)
+                digest, _, etag = f.read().strip().partition(" ")
+            # (a copy that does not parse is not kept by a 304; nor one the ETag is not of: two processes that both
+            # fetched, the lock waited out, may have written one's list and the other's ETag)
+            if old and etag and digest == _digest(body):
                 headers = {"If-None-Match": etag}
         except (OSError, ValueError):
             pass
@@ -574,8 +583,10 @@ class Dem:
         if not idx:
             raise ValueError("no z6 files listed")
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        # (the list first, then its ETag: a crash between them asks again with the old one, answered whole)
-        for p, data in ((path, r.body), (etag_path, (r.headers or {}).get("etag", "").encode())):
+        # (the list first, then its ETag with the list's digest: a crash or another process between them leaves the
+        # two unmatched, and the next refresh asks without If-None-Match, answered whole)
+        tag = f"{_digest(r.body)} {(r.headers or {}).get('etag', '')}".encode()
+        for p, data in ((path, r.body), (etag_path, tag)):
             tmp = f"{p}.{os.getpid()}.{threading.get_ident()}.tmp"
             with open(tmp, "wb") as f:
                 f.write(data)

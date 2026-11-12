@@ -326,6 +326,25 @@ class CoverageRefreshTest(unittest.TestCase):
             dem._coverage()
             self.assertEqual(len(f.asked), 2, "read from disk")
 
+    def test_an_etag_of_another_list_is_not_sent(self):
+        """Two processes that both fetched (the lock waited out) may leave one's list beside the other's ETag: that
+        ETag is not sent (a 304 would keep the wrong list until the list changes again); the list is asked whole."""
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            f = self.Fetcher()
+            dem = demmod.Dem(d, fetcher=f)
+            self.fresh_process()
+            dem._coverage()
+            path = os.path.join(d, "mapterhorn", "download_urls.json")
+            older = {"items": CoverageTest.DOC["items"][:2]}
+            with open(path, "w") as fh:
+                json.dump(older, fh)            # (the other process's older list, its ETag "v0" lost)
+            old = time.time() - demmod.COVERAGE_MAX_AGE_S - 60
+            os.utime(path, (old, old))
+            self.fresh_process()
+            self.assertEqual(dem._coverage(), {(10, 22): 16, (11, 22): 13})
+            self.assertEqual(f.asked, [None, None])
+
     def test_another_process_refreshing_is_waited_for(self):
         import json
         import xproc
