@@ -145,9 +145,12 @@ class OsmTags:
                     raise
                 size = int(m.group(3))
                 os.makedirs(os.path.dirname(pin), exist_ok=True)
-                with open(pin + ".tmp", "w") as f:
+                # (a writer's own temporary file: the pin is shared by OsmTags of several processes, and by fuel's and
+                # the picnic tables' of one (osmfuel.DIR), each renewing it under its own lock)
+                tmp = f"{pin}.{os.getpid()}.{threading.get_ident()}.tmp"
+                with open(tmp, "w") as f:
                     f.write(f"{etag}\n{size}\n{time.time()}\n")
-                os.replace(pin + ".tmp", pin)
+                os.replace(tmp, pin)
             d = os.path.join(self.raw_dir, self.DIR, re.sub(r"[^A-Za-z0-9]+", "_", etag).strip("_"))
             self._remote = (etag, rangeread.RemoteFile([self.url], size, d, self.fetcher, if_match=etag))
             self._checked = time.time()
