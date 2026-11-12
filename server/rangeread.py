@@ -30,6 +30,7 @@ import logging
 import os
 import re
 import threading
+import time
 from collections import OrderedDict
 
 import netfetch
@@ -67,6 +68,7 @@ def _quiet_call(quiet, fn, *a):
     finally:
         netfetch._quiet.on = prev
 BLOCK_WAIT_S = 60.0         # a block another process is fetching is waited for this long (xproc.once)
+URGENT_LOCK = ".urgent"     # (beside a block's lock: the claim of the readers its less urgent holder is not waited for)
 MEM_BYTES = 64 * 1024 * 1024    # in-memory block LRU shared by every RemoteFile of the process
 CONTENT_RANGE = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+|\*)")
 # Errors after which the next mirror is asked (the same bytes from another host); NotFound is not
@@ -359,13 +361,13 @@ class RemoteFile:
                 for i in held:
                     xproc.release(self._lock_path(i))
             for i in later:
-                b, lk = xproc.once(self._lock_path(i), lambda i=i: self._block_from_cache(i), BLOCK_WAIT_S, kind)
+                b, lk = self._await_block(i, kind)
                 if b is None:
                     try:
                         b = self._fetch_run(i, i + 1, kind).get(i)
                     finally:
                         if lk:
-                            xproc.release(self._lock_path(i))
+                            xproc.release(lk)
                 if b is not None:
                     out[i] = b
         finally:
@@ -380,6 +382,21 @@ class RemoteFile:
             if b is not None:
                 out[i] = b
         return out
+
+    def _await_block(self, i, kind):
+        """(block i, None) when another process fetched it meanwhile; (None, lock): this process fetches it, holding
+        lock (release it); (None, None): it fetches it unclaimed (waited BLOCK_WAIT_S in all). A claim less urgent than
+        kind is not waited for (xproc.once), but the more urgent readers share a second claim (URGENT_LOCK), one
+        fetching, rather than each fetching the block: the four road-tile workers' picnic reads (demand) passed the main
+        process's fuel cells' claims (prefetch) and each asked the same blocks one by one (2026-11-12, a cold run: 37 of
+        Layercake pois.parquet's 156 requests, 11.5 MB, asked a block another process had asked within 10 s, some
+        blocks four times)."""
+        deadline = time.monotonic() + BLOCK_WAIT_S
+        for lock in (self._lock_path(i), self._lock_path(i) + URGENT_LOCK):
+            b, mine = xproc.once(lock, lambda: self._block_from_cache(i), max(0.0, deadline - time.monotonic()), kind)
+            if b is not None or mine:
+                return b, (lock if mine else None)
+        return None, None
 
     def read(self, start, end, kind="demand"):
         """Bytes [start, end) of the file (cut at its end)."""

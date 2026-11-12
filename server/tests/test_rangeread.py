@@ -3,6 +3,8 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -66,6 +68,34 @@ class RangeIntegrityTest(unittest.TestCase):
             self.assertEqual(self.remote.read(0, 48), self.data[:48])
         self.assertEqual(self.fetcher.calls, [])
         self.assertFalse(list(Path(self.temp.name).glob("*.lock")))
+
+    def test_readers_past_a_less_urgent_claim_fetch_once(self):
+        """Another process prefetches block 0 (its claim held): two demand readers in two processes (two RemoteFiles
+        over one folder) do not wait behind it, but share the urgent claim: one fetches, the other reads its block."""
+        lock = os.path.join(self.temp.name, "0.blk.lock")
+        self.assertTrue(rangeread.xproc.take(lock, "prefetch"))
+        self.addCleanup(rangeread.xproc.release, lock)
+        gate = threading.Event()
+        get = self.fetcher.get
+
+        def slow(url, *, kind, headers):
+            gate.wait(2)
+            return get(url, kind=kind, headers=headers)
+        self.fetcher.get = slow
+        a, b = (rangeread.RemoteFile("https://example.invalid/data", len(self.data), self.temp.name, self.fetcher,
+                                     block=16) for _ in range(2))
+        out = {}
+        ths = [threading.Thread(target=lambda n=n, r=r: out.setdefault(n, r.read(0, 16))) for n, r in (("a", a),
+                                                                                                        ("b", b))]
+        for t in ths:
+            t.start()
+            time.sleep(0.2)                 # (a holds the urgent claim, waiting for its answer)
+        gate.set()
+        for t in ths:
+            t.join()
+        self.assertEqual(out, {"a": self.data[:16], "b": self.data[:16]})
+        self.assertEqual(self.fetcher.calls, [(0, 16)])
+        self.assertFalse(Path(self.temp.name, "0.blk.lock" + rangeread.URGENT_LOCK).exists())
 
     def test_missing_middle_block_is_an_error_not_shifted_bytes(self):
         with mock.patch.object(self.remote, "blocks", return_value={0: self.data[:16], 2: self.data[32:48]}):
