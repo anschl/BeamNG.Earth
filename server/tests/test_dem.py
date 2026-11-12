@@ -7,6 +7,7 @@ import time
 import unittest
 from unittest import mock
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -256,7 +257,7 @@ class CoverageTest(unittest.TestCase):
                     self.calls.append(url)
 
                     class R:
-                        body = json.dumps(CoverageTest.DOC).encode()
+                        status, body, headers = 200, json.dumps(CoverageTest.DOC).encode(), {"etag": '"v1"'}
                     return R()
                 return super().get(url, kind=kind, headers=headers)
         saved = dict(demmod._coverage)
@@ -278,6 +279,74 @@ class CoverageTest(unittest.TestCase):
         finally:
             demmod._coverage.clear()
             demmod._coverage.update(saved)
+
+
+class CoverageRefreshTest(unittest.TestCase):
+    """An old copy of the file list is asked again with its ETag (a 304 keeps it), by one process at a time."""
+
+    class Fetcher:
+        def __init__(self):
+            self.asked = []
+
+        def get(self, url, *, kind="demand", headers=None):
+            import json
+            assert url == demmod.COVERAGE_URL, url
+            self.asked.append(headers)
+            if (headers or {}).get("If-None-Match") == '"v1"':
+                return SimpleNamespace(status=304, body=b"", headers={})
+            return SimpleNamespace(status=200, body=json.dumps(CoverageTest.DOC).encode(), headers={"etag": '"v1"'})
+
+        def register_chain(self, name, urls):
+            pass
+
+    def setUp(self):
+        self.saved = dict(demmod._coverage)
+
+    def tearDown(self):
+        demmod._coverage.clear()
+        demmod._coverage.update(self.saved)
+
+    def fresh_process(self):
+        demmod._coverage.update(index=None, at=-1e18, failed=False)
+
+    def test_not_modified_keeps_the_copy(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = self.Fetcher()
+            dem = demmod.Dem(d, fetcher=f)
+            self.fresh_process()
+            self.assertEqual(dem._coverage(), {(10, 22): 16, (11, 22): 13})
+            path = os.path.join(d, "mapterhorn", "download_urls.json")
+            old = time.time() - demmod.COVERAGE_MAX_AGE_S - 60
+            os.utime(path, (old, old))
+            self.fresh_process()
+            self.assertEqual(dem._coverage(), {(10, 22): 16, (11, 22): 13})
+            self.assertEqual(f.asked, [None, {"If-None-Match": '"v1"'}])
+            self.assertGreater(os.path.getmtime(path), old + 60, "fresh again for the other processes")
+            self.fresh_process()
+            dem._coverage()
+            self.assertEqual(len(f.asked), 2, "read from disk")
+
+    def test_another_process_refreshing_is_waited_for(self):
+        import json
+        import xproc
+        with tempfile.TemporaryDirectory() as d:
+            f = self.Fetcher()
+            dem = demmod.Dem(d, fetcher=f)
+            path = os.path.join(d, "mapterhorn", "download_urls.json")
+            os.makedirs(os.path.dirname(path))
+            self.assertTrue(xproc.take(path + ".lock"))     # (as another process would hold it)
+
+            def other():
+                time.sleep(0.3)
+                with open(path, "w") as fh:
+                    json.dump(CoverageTest.DOC, fh)
+                xproc.release(path + ".lock")
+            t = threading.Thread(target=other)
+            t.start()
+            self.fresh_process()
+            self.assertEqual(dem._coverage(), {(10, 22): 16, (11, 22): 13})
+            t.join()
+            self.assertEqual(f.asked, [], "its copy taken, not asked again")
 
 
 class FillHolesTest(unittest.TestCase):

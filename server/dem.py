@@ -136,6 +136,9 @@ COVERAGE_URL = "https://download.mapterhorn.com/download_urls.json"
 COVERAGE_ZOOM = 6
 COVERAGE_MAX_AGE_S = 7 * 86400.0    # the copy on disk read again from the net after this (it adds areas)
 COVERAGE_RETRY_S = 600.0            # a failed read asked again after this (until then: every tile asked, as before)
+# The list (~160 KB) is asked again with its ETag (If-None-Match; a 304 keeps the copy on disk: its ETag stood for weeks,
+# 2026-11-12), by one process at a time (xproc.once): every process whose copy was old downloaded it whole.
+COVERAGE_WAIT_S = 30.0              # s another process's refresh of the list is waited for (then asked here)
 _coverage = {"index": None, "at": -1e18, "lock": threading.Lock()}
 
 
@@ -151,6 +154,21 @@ def coverage_index(doc):
             except (KeyError, TypeError, ValueError):
                 continue
     return out
+
+
+def _coverage_on_disk(path):
+    """(coverage_index, its time) of the file list on disk at path while it is younger than COVERAGE_MAX_AGE_S; None
+    when old or not to be read."""
+    try:
+        t = os.path.getmtime(path)
+        if time.time() - t >= COVERAGE_MAX_AGE_S:
+            return None
+        with open(path, "rb") as f:
+            return coverage_index(json.loads(f.read())), t
+    except (OSError, ValueError):
+        return None
+
+
 AWS = dict(name="aws-terrarium", ext="png", size=256,
            url="https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png")
 # Raw tiles whose disk write failed (a full disk: OSError 28) kept in memory instead, up to this many bytes per process,
@@ -513,29 +531,56 @@ class Dem:
             if c["index"] is None and now - c["at"] < COVERAGE_RETRY_S and c.get("failed"):
                 return None
             path = os.path.join(self.cache_dir, MAPTERHORN["name"], "download_urls.json")
-            try:
-                age = now - os.path.getmtime(path)
-                if age < COVERAGE_MAX_AGE_S:
-                    with open(path, "rb") as f:
-                        c["index"], c["at"], c["failed"] = coverage_index(json.loads(f.read())), now - age, False
-                        return c["index"]
-            except (OSError, ValueError):
-                pass
-            try:
-                body = self.fetcher.get(COVERAGE_URL, kind="demand").body
-                idx = coverage_index(json.loads(body))
-                if not idx:
-                    raise ValueError("no z6 files listed")
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
-                with open(tmp, "wb") as f:
-                    f.write(body)
-                os.replace(tmp, path)
-                c["index"], c["at"], c["failed"] = idx, now, False
-            except Exception as e:      # (offline, a host down, another format): ask every tile, as before
-                log.debug("dem: Mapterhorn coverage: %s: %s", type(e).__name__, e)
-                c["at"], c["failed"] = now, True
+            got = _coverage_on_disk(path)
+            if got is None:
+                import xproc
+                lock = path + ".lock"
+                got, mine = xproc.once(lock, lambda: _coverage_on_disk(path), COVERAGE_WAIT_S)
+                try:
+                    if got is None:
+                        got = self._coverage_fetch(path), time.time()
+                except Exception as e:      # (offline, a host down, another format): ask every tile, as before
+                    log.debug("dem: Mapterhorn coverage: %s: %s", type(e).__name__, e)
+                    c["at"], c["failed"] = now, True
+                    return c["index"]
+                finally:
+                    if mine:
+                        xproc.release(lock)
+            c["index"], c["at"], c["failed"] = got[0], got[1], False
             return c["index"]
+
+    def _coverage_fetch(self, path):
+        """The file list from the net (If-None-Match with the ETag of the copy on disk: a 304 keeps that copy, made
+        recent), written to path with its ETag beside it: its coverage_index."""
+        etag_path = path + ".etag"
+        headers = None
+        try:
+            with open(path, "rb") as f:
+                old = coverage_index(json.loads(f.read()))
+            with open(etag_path, encoding="utf-8") as f:
+                etag = f.read().strip()
+            if old and etag:                # (a copy that does not parse is not kept by a 304)
+                headers = {"If-None-Match": etag}
+        except (OSError, ValueError):
+            pass
+        r = self.fetcher.get(COVERAGE_URL, kind="demand", headers=headers)
+        if r.status == 304 and headers:
+            try:
+                os.utime(path)              # (fresh again: the other processes take it)
+            except OSError:
+                pass
+            return old
+        idx = coverage_index(json.loads(r.body))
+        if not idx:
+            raise ValueError("no z6 files listed")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # (the list first, then its ETag: a crash between them asks again with the old one, answered whole)
+        for p, data in ((path, r.body), (etag_path, (r.headers or {}).get("etag", "").encode())):
+            tmp = f"{p}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, p)
+        return idx
 
     def coarse_at(self, lat, lon):
         """Is the elevation at (lat, lon) only the coarse global model (Mapterhorn's file list has nothing deeper than
