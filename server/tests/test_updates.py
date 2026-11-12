@@ -118,6 +118,12 @@ class UpdatesTest(CacheCase):
         self.assertEqual(len(fresh.urls), 2, "fresh (selfupdate): asked again ...")
         self.assertEqual(fresh.headers[1].get("If-None-Match"), 'W/"l1"', "... with the ETag")
 
+    def test_an_answer_that_is_not_json_is_not_kept(self):
+        """A proxy's or an error page answered 200: no update this time, and GitHub asked again next time (not an
+        hour without the notice)."""
+        self.assertIsNone(updates.check("1.7.4-beta", FakeNet("<html>proxy</html>")))
+        self.assertEqual(updates.check("1.7.4-beta", FakeNet(published()))["latest"], "1.8.1")
+
     def test_unpublished_main_version_is_not_an_update(self):
         self.assertIsNone(updates.check("1.7.4-beta", FakeNet("1.8.1\n")))
         self.new_cache()

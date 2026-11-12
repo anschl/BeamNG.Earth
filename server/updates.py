@@ -126,7 +126,13 @@ def github_json(net, url, kind, fresh=False):
         except (netfetch.FetchError, OSError):
             return None
         if r.status != 304 or have is None:
-            have = {"url": url, "etag": r.headers.get("etag", ""), "body": r.body.decode("utf-8", "replace")}
+            body = r.body.decode("utf-8", "replace")
+            try:
+                parsed = json.loads(body)
+            except ValueError:          # (a proxy's or an error page: not kept, asked again next time)
+                return None
+            _write(path, {"url": url, "etag": r.headers.get("etag", ""), "body": body, "at": now})
+            return parsed
         have["at"] = now
         _write(path, have)
     try:
