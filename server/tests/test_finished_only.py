@@ -50,6 +50,17 @@ class FinishedOnlyTest(unittest.TestCase):
                             self.server._fin_path((self.src, 16, 1, 2)))     # (no analyses: another directory)
         self.assertEqual(self.worker._fin_path((self.src, 16, 1, 2)), self.server._fin_path((self.src, 16, 1, 2)))
 
+    def test_other_sources_share_the_plain_readers_directory(self):
+        """A de-shadow of one source leaves the other sources' finished pixels as they are: their tiles go where a
+        reader without the analyses keeps them (not twice)."""
+        own, other = self.server.chain[0], self.server.chain[1]
+        ds = _Analysis()
+        ds.source = own.name
+        server = imagery.Imagery(self.server.cache_dir, deshadow=ds)
+        plain = imagery.Imagery(self.server.cache_dir)
+        self.assertEqual(server._fin_path((other, 16, 1, 2)), plain._fin_path((other, 16, 1, 2)))
+        self.assertNotEqual(server._fin_path((own, 16, 1, 2)), plain._fin_path((own, 16, 1, 2)))
+
     def test_final_tile_used(self):
         key = (self.src, 16, 100, 200)
         self.keep(key)

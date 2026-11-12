@@ -1573,8 +1573,13 @@ class Imagery:
     # --- the finished pyramid (geotiles phase 3a) ------------------------------------------------
     def _fin_sig(self, src):
         """The settings a source's finished tiles depend on, as a short hash (their directory): FIN_VERSION, the
-        tone curves and, for the source the de-shadow / colour match correct, their mode and version."""
-        parts = [FIN_VERSION, self.lut.tobytes(), self.lut_ds.tobytes() if self.deshadow is not None else None]
+        tone curves and, for the source the de-shadow / colour match correct, their mode and version.
+        (The relit texels' tone curve only for the de-shadow's own source: the other sources' finished pixels are the same
+        with de-shadow on or off, and their tiles were kept twice, the server's and the far-tile processes' plain
+        readers' copies: ~210 MB of the ~1 GB of finished tiles of five cold places, 2026-11-12)"""
+        ds = self.deshadow
+        relights = ds is not None and getattr(ds, "source", src.name) == src.name
+        parts = [FIN_VERSION, self.lut.tobytes(), self.lut_ds.tobytes() if relights else None]
         for obj in (self.deshadow, self.colormatch):
             if obj is not None and getattr(obj, "source", src.name) == src.name:
                 parts.append((type(obj).__name__, getattr(obj, "mode", None), getattr(obj, "version", None),
