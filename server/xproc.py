@@ -52,8 +52,13 @@ def take(lock, kind="demand"):
             return True
         try:
             os.write(fd, ("%d %d %d" % (*_rank(kind), os.getpid())).encode())
-        finally:
+        except OSError:
+            # (a full disk makes the file but not its record: worked unlocked, as when it cannot be made, and no empty
+            # lock left for the others to wait STALE_S on. dem.py keeps its tiles in memory then)
             os.close(fd)
+            release(lock)
+            return True
+        os.close(fd)
         return True
     return False
 
