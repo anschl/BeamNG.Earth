@@ -5,8 +5,12 @@ Read as osmtags.py reads the highways file: the pinned version (ETag), the foote
 bbox statistics touch the cell, and only the columns used, through rangeread's block cache; in two steps (the small
 columns to find the cell's fuel rows, then names, brand, building and geometry of the row groups that have any).
 Unreachable: no OSM stations (the caller goes on with Overture's).
+The picnic tables (picnicsource.py) read the same file through this class's pin and block folder (DIR): one version for
+both, each block fetched once (2026-11-12: 114 of a cold cache's 120 fuel blocks, 28.5 MB over three places, were
+fetched again into a folder of picnicsource's own, its footer, 4.9 MB, too, and the two pins renewed apart).
 """
 import logging
+import os
 
 import osmtags
 import rangeread
@@ -33,7 +37,9 @@ def budget_ok(fetcher, share=OSM_FUEL_SHARE):
     used = (fetcher.snapshot().get(HOST) or {}).get("requests", 0)
     return used < share * b
 PATH = "osm/pois.parquet"
-BLOCKS_CAP = 64 * 1024 * 1024       # the POI file's cached blocks kept (prune_blocks: 461 MB for 54 places without it)
+BLOCKS_CAP = 64 * 1024 * 1024       # the POI file's cached blocks kept (prune_blocks: 461 MB for 54 places without it;
+                                    # the picnic tables' blocks too since they share the folder: theirs were nearly
+                                    # all the fuel cells' own, and unbounded in a folder of their own before)
 KEEP_TAIL = 16 * 1024 * 1024        # ... besides its last 16 MB: the footer (row-group index, 4.9 MB; 40 s to read again)
 PRUNE_EVERY_S = 30.0                # (MapData.osm_fuel_fetch prunes at most this often)
 # the amenities kept: fuel stations, and EV charging stations (the user, 2026-10-29: "real life ev stations mapped like
@@ -48,7 +54,7 @@ DETAIL = ("id", "brand", "name", "building")           # step 2: of the row grou
 class OsmFuel(osmtags.OsmTags):
     """The amenity=fuel features per map cell, from the pinned Layercake POIs version."""
 
-    DIR = "osmfuel"
+    DIR = "osmfuel"             # (picnicsource.Source pins and caches the same file here too)
 
     def __init__(self, raw_dir, fetcher, url=URL):
         super().__init__(raw_dir, fetcher, url)
@@ -65,8 +71,24 @@ class OsmFuel(osmtags.OsmTags):
                 if attempt:
                     raise
                 log.info("osmfuel: %s changed (was %s), taking the new version", self.url, etag)
-                self._forget()
+                self._forget(etag)
         return []
+
+    def _forget(self, etag=None):
+        """The version in use dropped (it changed under the reads), and its pin on disk unless that already names
+        another version than etag: the other reader of the pin (picnicsource, or another process) met the change first
+        and pinned the new one, which is taken as it is (not asked again, not left for a third version)."""
+        with self._lock:
+            self._remote = None
+            pin = os.path.join(self.raw_dir, self.DIR, "pinned")
+            try:
+                if etag is not None:
+                    with open(pin) as f:
+                        if f.read().split("\n")[0] != etag:
+                            return
+                os.remove(pin)
+            except OSError:
+                pass
 
     def warm(self, kind="prefetch"):
         """The pinned version and its row groups' index (the footer, 4.9 MB) read, nothing else: no cell (2026-10-29:
@@ -134,7 +156,6 @@ def prune_blocks(d, size, cap=BLOCKS_CAP, keep_tail=KEEP_TAIL, block=rangeread.B
     """The cached blocks in folder d of a size-byte file (rangeread's "<i>.blk") kept under cap, the oldest (by mtime)
     deleted first; the blocks of its last keep_tail bytes (the footer) never. A cell's stations are kept apart
     (MapData.osm_fuel_cached): a block is only worth keeping for the next cells of the same row groups."""
-    import os
     first_tail = max(0, (size - keep_tail) // block)
     body = []
     try:

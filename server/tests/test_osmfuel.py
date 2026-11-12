@@ -109,6 +109,34 @@ class OsmFuelBlocksTest(unittest.TestCase):
         self.assertEqual(body, list(range(25 - len(body), 25)))
 
 
+class OsmFuelVersionTest(unittest.TestCase):
+    """The picnic tables (picnicsource) read the POI file through the same pin: a version that changed under one reader
+    drops the pin only while it still names that version, so the new one the other reader pinned is taken as it is."""
+
+    def test_a_pin_renewed_by_the_other_reader_is_kept(self):
+        import osmfuel
+        from types import SimpleNamespace
+        etags = ['"v1"', '"v2"']
+
+        class Fetcher:
+            calls = 0
+
+            def get(self, url, kind=None, headers=None):
+                Fetcher.calls += 1
+                return SimpleNamespace(headers={"etag": etags[Fetcher.calls - 1],
+                                                "content-range": "bytes 0-15/9000000"})
+        d = tempfile.mkdtemp()
+        fuel, picnic = osmfuel.OsmFuel(d, Fetcher()), osmfuel.OsmFuel(d, Fetcher())
+        self.assertEqual(fuel.version()[0], '"v1"')
+        self.assertEqual(picnic.version()[0], '"v1"')
+        fuel._forget('"v1"')                        # (rangeread.Changed under the fuel reads)
+        self.assertEqual(fuel.version()[0], '"v2"')
+        picnic._forget('"v1"')                      # (the same change met later by the picnic reads)
+        self.assertEqual(picnic.version()[0], '"v2"', "the new pin taken")
+        self.assertEqual(Fetcher.calls, 2, "not asked again")
+        self.assertEqual(picnic.version()[1].cache_dir, fuel.version()[1].cache_dir)
+
+
 class OsmFuelReadTest(unittest.TestCase):
     """(2026-10-29: the start's index read turned away ten times, "bucket low, prefetch dropped") amenity = 'fuel' made
     DuckDB read the amenity column's bloom filter of every row group in the file, block by block (a game cell: 133 of

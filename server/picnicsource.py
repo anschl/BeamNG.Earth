@@ -6,26 +6,25 @@ land-use park whose mapped tables are only in OSM. Layercake's POIs file carries
 and tourism (https://data.openstreetmap.us/layercake/pois.parquet, ODbL). Like osmtags, only the
 row groups whose bbox touches the cell are read, and geometry only for a group that has a picnic
 row. A cell is remembered for the session.
+The version (ETag) and the cached blocks are osmfuel's, which reads the same file for the fuel stations: one pin, one
+block folder under its cap (osmfuel.DIR, BLOCKS_CAP), so a block both need is fetched once and both read one version.
+A cell's picnic rows stay in a folder of their own per version (DIR/<version>/cells).
 """
 import json
 import logging
 import os
-import re
 import threading
 import time
 
-import numpy as np
-
 import mapgeom
-import overture
+import osmfuel
 import rangeread
 
 log = logging.getLogger("earthd.picnic")
 
 URL = "https://data.openstreetmap.us/layercake/pois.parquet"
 PATH = "osm/pois.parquet"
-VERSION_TTL_S = 7 * 86400
-RETRY_S = 3600
+DIR = "picnicsource"            # the cells' picnic rows per version (_rows_dir); the blocks: osmfuel.OsmFuel.DIR
 COLUMNS = ("id", "leisure", "amenity", "tourism")
 TABLES = {"picnic_table"}
 SITES = {"picnic_site"}
@@ -33,19 +32,20 @@ GRILLS = {"bbq", "barbecue", "bbq_grill"}
 
 
 class Source:
-    """Picnic features of a map cell, from the pinned Layercake POIs version."""
+    """Picnic features of a map cell, from the Layercake POIs version pinned for the fuel stations too (osmfuel)."""
 
     def __init__(self, reader, fetcher, url=URL):
         self.reader, self.fetcher, self.url = reader, fetcher, url
         self.raw_dir = reader.raw_dir
+        # the file's pin, blocks and row-group index: osmfuel's (a pin and a block folder of this module's own fetched
+        # 114 of a cold cache's 120 fuel blocks and the 4.9 MB footer a second time, 2026-11-12)
+        self._pois = osmfuel.OsmFuel(self.raw_dir, fetcher, url)
         self._lock = threading.Lock()
-        self._remote = None
-        self._checked = 0.0
-        self._meta = None           # (RemoteFile, row groups)
         self._cells = {}            # (etag, z, x, y) -> Features
         self._down = False
         self._ready = {}            # (z, x, y) -> Features read (cells(wait=False))
         self._threads = {}          # (z, x, y) -> its background read
+        self._pruned = -1e9         # (time.monotonic() of the last _prune)
 
     def cells(self, keys, kind="demand", wait=True):
         """Features of the picnic rows in these map cells (an empty list when the file cannot be read). wait=False (a
@@ -102,16 +102,16 @@ class Source:
             if cached is not None:
                 return cached
             try:
-                rows = _rows_load(remote, key)
+                rows = _rows_load(self._rows_dir(remote), key)
                 if rows is None:
                     rows = self._query(remote, key.bounds(), kind)
-                    _rows_save(remote, key, rows)
+                    _rows_save(self._rows_dir(remote), key, rows)
                 feats = features_of(rows)
             except rangeread.Changed:
                 if attempt:
                     raise
                 log.info("picnic tables: %s changed (was %s)", self.url, etag)
-                self._forget()
+                self._forget(etag)
                 continue
             except Exception as ex:
                 self._down = True
@@ -122,67 +122,28 @@ class Source:
         return None
 
     def _version(self, kind):
-        with self._lock:
-            if self._remote is not None and time.time() - self._checked < VERSION_TTL_S:
-                return self._remote
-            pin = os.path.join(self.raw_dir, "picnicsource", "pinned")
-            etag = size = None
-            try:
-                with open(pin) as f:
-                    etag, size, when = f.read().split("\n")[:3]
-                    size, when = int(size), float(when)
-                if time.time() - when > VERSION_TTL_S:
-                    etag = None
-            except (OSError, ValueError):
-                etag = None
-            if etag is None:
-                down = os.path.join(self.raw_dir, "picnicsource", "unreachable")
-                try:
-                    recent = time.time() - os.path.getmtime(down) < RETRY_S
-                except OSError:
-                    recent = False
-                if recent:
-                    raise rangeread.RangeError(f"{self.url}: unreachable at the last try")
-                try:
-                    r = self.fetcher.get(self.url, kind=kind, headers={"Range": "bytes=0-15"})
-                    etag = r.headers.get("etag", "").strip()
-                    m = rangeread.CONTENT_RANGE.match(r.headers.get("content-range", ""))
-                    if not etag or not m or m.group(3) == "*":
-                        raise rangeread.RangeError(f"{self.url}: no ETag or size")
-                except Exception:
-                    os.makedirs(os.path.dirname(down), exist_ok=True)
-                    open(down, "w").close()
-                    raise
-                size = int(m.group(3))
-                os.makedirs(os.path.dirname(pin), exist_ok=True)
-                with open(pin + ".tmp", "w") as f:
-                    f.write(f"{etag}\n{size}\n{time.time()}\n")
-                os.replace(pin + ".tmp", pin)
-            d = os.path.join(self.raw_dir, "picnicsource", re.sub(r"[^A-Za-z0-9]+", "_", etag).strip("_"))
-            self._remote = (etag, rangeread.RemoteFile([self.url], size, d, self.fetcher, if_match=etag))
-            self._checked = time.time()
-            return self._remote
+        """(etag, RemoteFile) of the version in use: osmfuel's pin (osmtags.OsmTags.version)."""
+        return self._pois.version(kind)
 
-    def _forget(self):
+    def _forget(self, etag):
+        """Version etag dropped (it changed under the reads): its cells, and the shared pin unless the fuel stations
+        (or another process) have already pinned the new one (osmfuel.OsmFuel._forget)."""
         with self._lock:
-            self._remote = None
-            self._meta = None
             self._cells.clear()
-            try:
-                os.remove(os.path.join(self.raw_dir, "picnicsource", "pinned"))
-            except OSError:
-                pass
+        self._pois._forget(etag)
 
-    def _groups(self, con, uri, remote, kind):
-        with self._lock:
-            got = self._meta
-        if got is not None and got[0] is remote:
-            return got[1]
-        # (parsed once per version on disk, as osmtags does: each server process parsed the planet file's footer)
-        groups = overture.parquet_row_groups(con, uri, remote, kind)
-        with self._lock:
-            self._meta = (remote, groups)
-        return groups
+    def _rows_dir(self, remote):
+        """The version's folder of cell rows: DIR/<the version's folder name>, where they were before the blocks
+        moved to osmfuel's folder (a version's rows already kept are still read)."""
+        return os.path.join(self.raw_dir, DIR, os.path.basename(remote.cache_dir))
+
+    def _prune(self, remote):
+        """The shared block folder kept under osmfuel's cap at most every PRUNE_EVERY_S: MapData prunes it after the
+        fuel cells (osm_fuel_fetch), but the picnic reads land there too, and with the fuel stations off only here."""
+        now = time.monotonic()
+        if now - self._pruned >= osmfuel.PRUNE_EVERY_S:
+            self._pruned = now
+            osmfuel.prune_blocks(remote.cache_dir, remote.size)
 
     def _query(self, remote, bounds, kind):
         lon0, lat0, lon1, lat1 = bounds
@@ -191,8 +152,8 @@ class Source:
         con, proto, errors = rd._connect(files, kind)
         try:
             uri = f"'{proto}://{PATH}'"
-            groups = self._groups(con, uri, remote, kind)
-            cand = _candidates(groups, bounds)
+            groups = self._pois._groups(con, uri, remote, kind)
+            cand = self._pois._candidates(groups, bounds)
             if not cand:
                 return []
             want = set(COLUMNS) | {"bbox"}
@@ -229,6 +190,7 @@ class Source:
             raise
         finally:
             con.close()
+            self._prune(remote)
         out = []
         for fid, leisure, amenity, tourism, num in rows:
             geom = geoms.get(num)
@@ -238,23 +200,23 @@ class Source:
         return out
 
 
-def _rows_path(remote, key):
-    return os.path.join(remote.cache_dir, "cells", str(key.z), str(key.x), f"{key.y}.json")
+def _rows_path(d, key):
+    return os.path.join(d, "cells", str(key.z), str(key.x), f"{key.y}.json")
 
 
-def _rows_load(remote, key):
+def _rows_load(d, key):
     """A cell's picnic rows kept from an earlier read of this version (_rows_save), or None. Every server process
     queried each cell's row groups again (a scan of the POI file's few columns per cell, ~1.3 CPU-s of a warm Le Mans
     block + 4 road tiles, 2026-11-11), and every run after the first."""
     try:
-        with open(_rows_path(remote, key), encoding="utf-8") as f:
+        with open(_rows_path(d, key), encoding="utf-8") as f:
             return [(int(fid), le, am, to, bytes.fromhex(g)) for fid, le, am, to, g in json.load(f)]
     except (OSError, ValueError, TypeError):
         return None
 
 
-def _rows_save(remote, key, rows):
-    path = _rows_path(remote, key)
+def _rows_save(d, key, rows):
+    path = _rows_path(d, key)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
@@ -263,19 +225,6 @@ def _rows_save(remote, key, rows):
         os.replace(tmp, path)
     except (OSError, TypeError, ValueError) as e:
         log.debug("picnic rows of %s not kept: %s", key, e)
-
-
-def _candidates(groups, bounds):
-    lon0, lat0, lon1, lat1 = bounds
-
-    def stat(g, leaf, i, default):
-        try:
-            return float(g["bbox"][leaf][i])
-        except (KeyError, TypeError, ValueError):
-            return default
-    return [rg for rg, g in sorted(groups.items())
-            if stat(g, "xmin", 0, -1e9) <= lon1 and stat(g, "xmax", 1, 1e9) >= lon0
-            and stat(g, "ymin", 0, -1e9) <= lat1 and stat(g, "ymax", 1, 1e9) >= lat0]
 
 
 def _mark(leisure, amenity, tourism):

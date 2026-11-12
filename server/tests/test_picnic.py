@@ -296,14 +296,15 @@ class NoWaitTest(unittest.TestCase):
         import threading
         import picnicsource
         from types import SimpleNamespace
+        import os
         with tempfile.TemporaryDirectory() as d:
-            remote = SimpleNamespace(cache_dir=d)
+            remote = SimpleNamespace(cache_dir=os.path.join(d, "osmfuel", "etag"))     # (the shared block folder)
             import struct
             rows = [(7, "picnic_table", None, None, struct.pack("<BIdd", 1, 1, 2.5, 48.1)), (9, None, "bbq", "", b"")]
 
             def source(answer):
                 src = picnicsource.Source.__new__(picnicsource.Source)
-                src._lock, src._down, src._cells = threading.Lock(), False, {}
+                src._lock, src._down, src._cells, src.raw_dir = threading.Lock(), False, {}, d
                 src._version = lambda kind: ("etag", remote)
                 src._query = answer
                 return src
@@ -320,7 +321,32 @@ class NoWaitTest(unittest.TestCase):
             self.assertEqual(len(asked), 1, "the second process read the kept rows")
             self.assertEqual(list(a.ids), list(b.ids))
             self.assertEqual(list(a.attrs["tags"]), list(b.attrs["tags"]))
-            self.assertEqual(picnicsource._rows_load(remote, Key()), rows)
+            self.assertEqual(picnicsource._rows_load(os.path.join(d, "picnicsource", "etag"), Key()), rows,
+                             "kept where they were before the blocks moved: picnicsource/<version>/cells")
+
+    def test_one_version_and_block_folder_with_the_fuel_stations(self):
+        # (2026-11-12: 114 of a cold cache's 120 fuel blocks and the 4.9 MB footer fetched again for the picnic tables,
+        # into a folder and under a pin of their own) the picnic tables read osmfuel's pin and block folder
+        import os
+        import tempfile
+        import osmfuel
+        import picnicsource
+        from types import SimpleNamespace
+
+        class Fetcher:
+            calls = 0
+
+            def get(self, url, kind=None, headers=None):
+                Fetcher.calls += 1
+                return SimpleNamespace(headers={"etag": '"v1"', "content-range": "bytes 0-15/9000000"})
+        with tempfile.TemporaryDirectory() as d:
+            src = picnicsource.Source(SimpleNamespace(raw_dir=d), Fetcher())
+            etag, remote = src._version("demand")
+            fuel_etag, fuel_remote = osmfuel.OsmFuel(d, Fetcher()).version("demand")
+            self.assertEqual(Fetcher.calls, 1, "the version asked once: the fuel stations read the picnic tables' pin")
+            self.assertEqual((etag, remote.cache_dir), (fuel_etag, fuel_remote.cache_dir))
+            self.assertEqual(os.path.dirname(remote.cache_dir), os.path.join(d, osmfuel.OsmFuel.DIR))
+            self.assertEqual(src._rows_dir(remote), os.path.join(d, "picnicsource", "v1"))
 
     def test_mapdata_side_prefetch_starts_every_side_source(self):
         import mapdata
