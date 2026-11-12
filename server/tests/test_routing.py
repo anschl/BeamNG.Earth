@@ -18,12 +18,20 @@ class RoutingTest(unittest.TestCase):
 
     def test_parse(self):
         data = {"code": "Ok", "routes": [{"distance": 1234.5, "duration": 99.0,
-                                         "geometry": {"coordinates": [[-76.59, 39.28], [-76.60, 39.28], [-76.60, 39.29]]}}]}
+                                         "geometry": "_wm|iA~ytaqC?~oR_pR?"}]}
         r = routing.parse(data)
         self.assertEqual(r["points"][0], [39.28, -76.59])
         self.assertEqual((r["dist"], r["dur"]), (1234.5, 99.0))
         with self.assertRaises(ValueError):
             routing.parse({"code": "NoRoute", "routes": []})
+
+    def test_decode_polyline6(self):
+        # (the polyline format's reference points at 6 decimals; OSRM's geometries=polyline6, a quarter of GeoJSON's bytes)
+        self.assertEqual(routing.decode_polyline6("_izlhA~rlgdF_{geC~ywl@_kwzCn`{nI"),
+                         [(38.5, -120.2), (40.7, -120.95), (43.252, -126.453)])
+        self.assertEqual(routing.decode_polyline6(""), [])
+        with self.assertRaises(ValueError):
+            routing.decode_polyline6("_izlhA~rlgd")
 
     def test_resample_even_steps(self):
         line = [(39.0, -76.0), (39.0, -75.9)]              # ~8.6 km east, one straight segment
@@ -54,7 +62,7 @@ class RoutingTest(unittest.TestCase):
 
     def test_parse_legs(self):
         data = {"code": "Ok", "routes": [{"distance": 3000, "duration": 200,
-                                          "geometry": {"coordinates": [[-76.0, 39.0], [-76.01, 39.01], [-76.02, 39.0]]},
+                                          "geometry": "_{jkiA~nt}oC_pR~oR~oR~oR",
                                           "legs": [{"distance": 1000, "duration": 70}, {"distance": 2000, "duration": 130}]}]}
         self.assertEqual(routing.parse(data)["legs"], [[1000.0, 70.0], [2000.0, 130.0]])
         data["routes"][0]["legs"] = [{"distance": 3000, "duration": 200}]

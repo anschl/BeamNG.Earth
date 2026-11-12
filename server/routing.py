@@ -12,8 +12,11 @@ import math
 
 import netfetch
 
+# The geometry as an encoded polyline of 6 decimals (decode_polyline6): OSRM keeps its coordinates as integer
+# millionths of a degree, so it is the same points as GeoJSON's, in a quarter of the bytes (Berlin-Munich: 32 KB
+# instead of 145 KB; a re-route every 20 s while the player is off the route).
 OSRM_URL = "https://routing.openstreetmap.de/routed-car/route/v1/driving/{coords}" \
-           "?overview=full&geometries=geojson&steps=false"
+           "?overview=full&geometries=polyline6&steps=false"
 # Waypoints between the start and the destination (GitHub #935 / #886: a charging stop, a route with several stops):
 # OSRM's own intermediate coordinates, at most MAX_VIA of them (one request for the whole trip, the FOSSGIS fair use).
 MAX_VIA = 10
@@ -107,14 +110,38 @@ def resample(points, max_points=120, min_step_m=50.0):
     return out
 
 
+def decode_polyline6(text):
+    """[(lat, lon)] of an encoded polyline (Google's format) of 6 decimals: per point the change of latitude, then of
+    longitude, in millionths of a degree, as zigzag-signed 5-bit groups + 63. Raises ValueError on a cut-off one.
+    Pure."""
+    out, i, n, lat, lon = [], 0, len(text), 0, 0
+    while i < n:
+        deltas = []
+        for _ in range(2):
+            shift = value = 0
+            while True:
+                if i >= n:
+                    raise ValueError("polyline cut off")
+                b = ord(text[i]) - 63
+                i += 1
+                value |= (b & 0x1F) << shift
+                shift += 5
+                if b < 0x20:
+                    break
+            deltas.append(~(value >> 1) if value & 1 else value >> 1)
+        lat += deltas[0]
+        lon += deltas[1]
+        out.append((lat / 1e6, lon / 1e6))
+    return out
+
+
 def parse(data):
-    """{points: [[lat, lon], ...], dist (m), dur (s)} of an OSRM route response, or raises ValueError. Pure."""
+    """{points: [[lat, lon], ...], dist (m), dur (s)} of an OSRM route response (its geometry a polyline6), or raises
+    ValueError. Pure."""
     if not isinstance(data, dict) or data.get("code") != "Ok" or not data.get("routes"):
         raise ValueError(f"no route ({(data or {}).get('code') if isinstance(data, dict) else 'bad answer'})")
     r = data["routes"][0]
-    coords = r["geometry"]["coordinates"]
-    pts = [(float(c[1]), float(c[0])) for c in coords]
-    pts = simplify(pts)
+    pts = simplify(decode_polyline6(str(r["geometry"])))
     tol = SIMPLIFY_M
     while len(pts) > MAX_POINTS:            # very long routes: coarser
         tol *= 2
