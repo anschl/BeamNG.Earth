@@ -92,9 +92,21 @@ RELEASES_API = f"https://api.github.com/repos/{REPO}/releases?per_page=30"
 # server process and every restart (addons.GitHubCache's way, in a folder of its own: the add-ons keep their own
 # lane and retries): asked again after TTL_S with If-None-Match; a 304 has no body and does not count against
 # GitHub's 60 requests an hour per address. (Before, 2026-11-12: releases/latest, 17 KB, asked after every hello and
-# at each launcher start; a development build's list, 584 KB, once a process every 3 h, in memory.) The default
-# cache folder, not the server's --cache-dir: the launcher asks before it knows that one.
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "beamng-earth", "updates")
+# at each launcher start; a development build's list, 584 KB, once a process every 3 h, in memory.) In the launcher's
+# own folder (apppaths.data_dir: %LOCALAPPDATA%\beamng-earth on Windows), not the server's --cache-dir: the launcher
+# asks before it knows that one.
+def _cache_dir():
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if root not in sys.path:            # (apppaths beside launcher.py, one folder up: earthd._app_modules' way)
+            sys.path.append(root)
+        import apppaths
+        return os.path.join(apppaths.data_dir(), "updates")
+    except Exception:                       # (no app folder beside the server: the Linux default)
+        return os.path.join(os.path.expanduser("~"), ".cache", "beamng-earth", "updates")
+
+
+CACHE_DIR = _cache_dir()
 TTL_S = 3600.0
 
 
