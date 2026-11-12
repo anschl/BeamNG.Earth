@@ -111,6 +111,22 @@ class LruTest(Base):
             c.evict()
         self.assertFalse(exists(self.root, "dem/mapterhorn/15/1/2.webp"))
 
+    def test_overture_blocks_go_before_the_cells_built_from_them(self):
+        """Overture's parquet blocks (FIRST) go before everything else, however recently used; the rest of
+        mapdata/raw (its STAC JSON) and the built cells go least recently used after them."""
+        for i in range(4):
+            put(self.root, f"mapdata/v1/overture/r1/roads/14/1/{i}.npz", MB, T0 - (20 - i) * DAY)    # the oldest
+        put(self.root, "mapdata/raw/overture/r1/stac/base/water.json", MB, T0 - 30 * DAY)
+        for i in range(4):
+            put(self.root, f"mapdata/raw/overture/r1/base/water/part-0/{i}.blk", MB, T0 - DAY)
+        self.clock.t += 7200
+        c = self.make(cap_gb=0.008)         # 9 MB in use, cap 8 MB -> 7.2 MB: two blocks go
+        self.assertEqual(c.evict(), (2, 2 * MB))
+        self.assertEqual(sum(exists(self.root, f"mapdata/raw/overture/r1/base/water/part-0/{i}.blk")
+                             for i in range(4)), 2)
+        self.assertTrue(all(exists(self.root, f"mapdata/v1/overture/r1/roads/14/1/{i}.npz") for i in range(4)))
+        self.assertTrue(exists(self.root, "mapdata/raw/overture/r1/stac/base/water.json"))
+
     def test_a_disk_short_of_its_reserve_cuts_the_cache_back(self):
         """A cap larger than the disk's free space (or unlimited): when the disk has less than its reserve free, the
         tick evicts the least recently used files whatever the cap; files of this session's last hour stay."""
@@ -452,7 +468,7 @@ class ClearTest(Base):
         other producers; its 404 markers stay through eviction, its files being written are not tracked."""
         old = T0 - 3 * DAY
         put(self.root, "mapdata/v1/overture/2026-09-23.1/roads/14/1/0.npz", MB, old - DAY)
-        put(self.root, "mapdata/raw/overture/2026-09-23.1/part-0/0.blk", MB, old)
+        put(self.root, "mapdata/raw/worldcover/v200/x/0.blk", MB, old)       # (not Overture's: FIRST)
         put(self.root, "mapdata/raw/overture/2026-09-23.1/part-1/404", 0, old - 2 * DAY)
         put(self.root, "mapdata/v1/overture/2026-09-23.1/roads/14/1/1.npz.1.2.tmp.npz", MB, T0)
         put(self.root, "mapdata/raw/worldcover/v200/x/0.blk.1.2.tmp", MB, T0)
@@ -467,7 +483,7 @@ class ClearTest(Base):
         self.assertTrue(exists(self.root, "mapdata/v1/overture/2026-09-23.1/roads/14/1/1.npz.1.2.tmp.npz"),
                         "a file being written is not evicted")
         c.clear()
-        self.assertFalse(exists(self.root, "mapdata/raw/overture/2026-09-23.1/part-0/0.blk"), "cleared")
+        self.assertFalse(exists(self.root, "mapdata/raw/worldcover/v200/x/0.blk"), "cleared")
         self.assertFalse(exists(self.root, "mapdata/raw/overture/2026-09-23.1/part-1/404"), "markers too")
 
     def test_clear_keeps_only_what_was_used_lately(self):

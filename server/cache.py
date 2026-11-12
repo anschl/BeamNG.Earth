@@ -26,7 +26,8 @@ per request: one dict update under a lock. At start a background thread walks th
 this module) and merges it with the index; until then ready is False and nothing is evicted.
 
 Eviction (a background thread): when the tracked bytes exceed the cap, least recently used files go
-until LOW_WATER (90 %) of the cap is left, at most every EVICT_S; the raw elevation tiles (KEEP_PREFIXES) are passed over
+until LOW_WATER (90 %) of the cap is left, at most every EVICT_S; Overture's parquet blocks (FIRST) go before the rest,
+oldest first; the raw elevation tiles (KEEP_PREFIXES) are passed over
 while they are at most KEEP_SHARE of that (dear to download again, small beside the rest). Never evicted: gravity/, files this
 server process used within PROTECT_S (an hour: the area around the player), and markers (_marker: empty files such
 as "no seams", and the tile columns' miss indexes, missindex.py: they save requests; clear() removes them).
@@ -80,6 +81,11 @@ CLEAR_KEEP_S = 600.0        # "Clear cache" keeps the files used this recently (
 # over them while they are at most KEEP_SHARE of what it cuts down to (their own oldest go first beyond that).
 KEEP_PREFIXES = ("dem/mapterhorn/", "dem/aws-terrarium/")
 KEEP_SHARE = 0.25
+# Evicted before everything else, oldest first: Overture's parquet blocks (rangeread.py, mapdata/raw/overture/<release>/
+# .../<i>.blk), ~260 MB a new place, five times the map cells built from them, and read only to build cells (a cached
+# cell never reads them). Plain LRU kept them beside their cells and the cap held fewer places; a return to an old
+# place's edge now downloads its blocks again. (key prefix, suffix)
+FIRST = (("mapdata/raw/overture/", ".blk"),)
 MIRRORED = ("mapdata-mirror",)      # counted and cleared, never evicted file by file (a cell's files and its "ok" go
                                     # together: mapdata prunes it whole, MIRROR_MB)
 KEPT = ("gravity", "airports")                              # counted only
@@ -109,6 +115,11 @@ def _marker(key, size):
     """A file that only saves requests: an empty marker ("no seams") or a column's miss index (missindex.NAME). Never
     evicted (it frees next to nothing and the requests it saves are slow ones); "Clear cache" removes it."""
     return size == 0 or key.endswith("/" + missindex.NAME)
+
+
+def _first(key):
+    """Is key one of the FIRST files (evicted before the rest)?"""
+    return any(key.startswith(p) and key.endswith(s) for p, s in FIRST)
 
 
 def cap_bytes(gb):
@@ -488,8 +499,8 @@ class Cache(NoCache):
         return True
 
     def evict(self, target=None):
-        """Remove least recently used files until the tracked bytes are at most target (default:
-        LOW_WATER of the cap; nothing while under the cap). Returns (files, bytes) removed."""
+        """Remove least recently used files (the FIRST ones before the rest) until the tracked bytes are at most
+        target (default: LOW_WATER of the cap; nothing while under the cap). Returns (files, bytes) removed."""
         if not self.managed or not self.ready:
             return 0, 0
         with self._lock:
@@ -499,15 +510,15 @@ class Cache(NoCache):
                     return 0, 0
                 target = int(cap * LOW_WATER)
             floor = self._floor()
-            order = sorted((e[1], k) for k, e in self._entries.items()
+            order = sorted((not _first(k), e[1], k) for k, e in self._entries.items()
                            if self._evictable(k, e[0]) and e[1] < floor)
-        order = self._unpinned(order, lambda item: item[1])
+        order = self._unpinned(order, lambda item: item[-1])
         self._last_evict = self.now()
         n = b = 0
         kept = self._kept_bytes()
         held = []
         for item in order:
-            key = item[1]
+            key = item[-1]
             if self._used <= target:
                 break
             keep = key.startswith(KEEP_PREFIXES)
@@ -519,7 +530,7 @@ class Cache(NoCache):
                 n, b = n + 1, b + got
                 if keep:
                     kept -= got
-        for _, key in held:
+        for *_, key in held:
             if self._used <= target:
                 break
             got = self._remove(key, floor, empty_too=False)
