@@ -1671,9 +1671,11 @@ class Imagery:
                 continue
             ck = (s.name, z, x0, y0, k)
             full = self._full_blocks.get(ck)
+            keys = [(s, z, tx % n, ty) for ty in range(y0 - 1, y0 + side + 1) for tx in range(x0 - 1, x0 + side + 1)]
+            if full and not all(self._on_disk(kk) for kk in keys):
+                self._full_blocks.pop(ck, None)     # (evicted or discarded since: the lazy source may be needed again)
+                full = None
             if full is None:
-                keys = [(s, z, tx % n, ty) for ty in range(y0 - 1, y0 + side + 1)
-                        for tx in range(x0 - 1, x0 + side + 1)]
                 if not all(0 <= kk[3] < n and not outside(kk) and self._on_disk(kk) for kk in keys):
                     continue                # (not all fetched yet: no verdict)
                 full = all(_draws_whole(self._disk_tile(kk)) for kk in keys)

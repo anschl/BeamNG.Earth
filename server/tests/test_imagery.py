@@ -808,6 +808,23 @@ class ExportImageryTest(unittest.TestCase):
         np.testing.assert_array_equal(rgb, rgb_ref)
         self.assertEqual(used, used_ref)
 
+    def test_a_full_block_whose_tiles_left_the_disk_is_not_full(self):
+        """The 'filled' verdict holds only while the cache's tiles are on disk: one evicted, the lazy source is
+        warmed again there."""
+        chain = ("virginia", "naipusda", "usgs")
+        vs, naip = imagery.SOURCES["virginia"], imagery.SOURCES["naipusda"]
+        im = self.make(chain=chain, serve_xyz=lambda name, z, x, y: (200, png(background(z, x, y))))
+        lat, lon, _ = self.frame.enu_to_geodetic(0.0, 0.0, 0.0)
+        fx, fy = imagery.mercator_px(float(lat), float(lon), 17)
+        x, y = int(fx) // imagery.TILE, int(fy) // imagery.TILE
+        k = naip.export
+        x0, y0 = (x >> k) << k, (y >> k) << k
+        ring = {(vs, 17, tx, ty) for tx in range(x0 - 1, x0 + (1 << k) + 1) for ty in range(y0 - 1, y0 + (1 << k) + 1)}
+        im.tiles(ring)
+        self.assertTrue(im._filled_before(naip, 17, x, y))
+        os.remove(im._paths(vs, 17, x0, y0)[0])
+        self.assertFalse(im._filled_before(naip, 17, x, y))
+
     def test_us_sources_never_asked_outside_the_us(self):
         """Amsterdam: no USGS coverage probe, no NAIP export (a cold visit sent basemap.nationalmap.gov 50 requests, all
         404, and NAIP exports before those had answered); the US's states and territories are still asked."""
